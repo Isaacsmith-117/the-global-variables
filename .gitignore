@@ -1,0 +1,26 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.env
+
+# --- Datasets & Data ---
+# Exclude raw or downloaded datasets so you don't commit gigabytes of images
+data/
+datasets/
+
+# --- YOLO Training & Output Runs ---
+# Excludes training logs, weights, and prediction outputs
+runs/
+*.pt
+
+# --- IDEs & Operating Systems ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
