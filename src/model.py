@@ -6,11 +6,11 @@ from ultralytics import YOLO
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_YAML = PROJECT_ROOT / "data" / "data.yaml"
-QUICK_EPOCHS = 3
+QUICK_HOURS = 0.4  # About 24 minutes, so a CPU run stays under 30 minutes in total.
 FULL_EPOCHS = 50
-QUICK_FRACTION = 0.1
+QUICK_FRACTION = 0.2
 PATIENCE = 10
-IMAGE_SIZE = 416
+IMAGE_SIZE = 480  # Must be a multiple of 32, the model's stride.
 BATCH_SIZE = 8
 
 
@@ -37,9 +37,9 @@ def main(argv=None):
         raise SystemExit(f"Dataset configuration missing: {data_yaml}")
 
     device = select_device() if args.device == "auto" else args.device
-    epochs = QUICK_EPOCHS if args.mode == "quick" else FULL_EPOCHS
     fraction = QUICK_FRACTION if args.mode == "quick" else 1.0
-    print(f"Training mode: {args.mode} | Device: {device} | Max epochs: {epochs}")
+    hours = QUICK_HOURS if args.mode == "quick" else None
+    print(f"Training mode: {args.mode} | Device: {device}")
 
     # Load a pre-trained nano model for maximum speed.
     model = YOLO(str(PROJECT_ROOT / "yolov8n.pt"))
@@ -47,7 +47,8 @@ def main(argv=None):
         data=str(data_yaml),
         project=str(PROJECT_ROOT / "runs"),
         name=args.mode,
-        epochs=epochs,
+        epochs=FULL_EPOCHS,
+        time=hours,  # Quick mode trains for QUICK_HOURS instead of a number of epochs.
         patience=PATIENCE,  # Stop after this many epochs without validation improvement.
         imgsz=IMAGE_SIZE,
         batch=BATCH_SIZE,

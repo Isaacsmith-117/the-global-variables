@@ -21,6 +21,7 @@ dist/
 
 # --- Datasets & Data ---
 # Exclude raw or downloaded datasets so you don't commit gigabytes of images
+# (the CylinDeRS dataset and the tracking video live in data/)
 data/
 datasets/
 
