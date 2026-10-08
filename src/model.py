@@ -16,6 +16,7 @@ def main():
         data=str(data_yaml),
         project=str(PROJECT_ROOT / "runs"),
         epochs=3,  # Just 3 epochs to see if it runs.
+        patience=10,  # Stop after 10 epochs without validation improvement.
         imgsz=416,  # Lower resolution speeds up the test.
         batch=8,  # Small batch size to prevent memory errors.
         fraction=0.1,  # Uses only 10% of the training dataset.
