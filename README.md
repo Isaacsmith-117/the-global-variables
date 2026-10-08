@@ -97,7 +97,8 @@ See the [Ultralytics validation guide](https://docs.ultralytics.com/modes/val/).
 
 Tracking runs the detector on a video and links the detections from frame to
 frame, so every cylinder keeps the same ID while it moves on the conveyor belt.
-Put the video at `data/video_banda.mp4` (ignored by Git) and run:
+Put the video in `data/` (ignored by Git), write its file name in `VIDEO` at the
+top of `src/track.py` (now `filling_plant_bolivia.webm`) and run:
 
 ```bash
 python src/track.py

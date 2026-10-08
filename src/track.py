@@ -6,7 +6,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Weights from src/model.py. Change "train" to "colab" to use the Colab model.
 WEIGHTS = PROJECT_ROOT / "runs" / "train" / "weights" / "best.pt"
-VIDEO = PROJECT_ROOT / "data" / "video_banda.mp4"
+VIDEO = PROJECT_ROOT / "data" / "filling_plant_bolivia.webm"
 
 if __name__ == "__main__":
     model = YOLO(str(WEIGHTS))
