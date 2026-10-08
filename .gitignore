@@ -4,10 +4,20 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.venv/
 env/
 venv/
 ENV/
 .env
+.env.*
+!.env.example
+
+# --- Python tooling ---
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
 
 # --- Datasets & Data ---
 # Exclude raw or downloaded datasets so you don't commit gigabytes of images
