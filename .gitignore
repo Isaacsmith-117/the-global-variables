@@ -20,12 +20,33 @@ dist/
 *.egg-info/
 
 # --- Datasets & Data ---
-# Exclude raw or downloaded datasets so you don't commit gigabytes of images
+# Local CylinDeRS dataset, Primagaz photos, and Primagaz video footage
 data/
 datasets/
 
+# Keep raw videos local even if copied outside data/
+*.webm
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.asf
+*.gif
+*.m4v
+*.mpeg
+*.mpg
+*.ts
+*.wmv
+
 # --- YOLO Training & Output Runs ---
-# Excludes training logs, weights, and prediction outputs
+# Keep historical and new generated outputs local
+/runs/
+/src/runs/
+*.pt
+
+# Only these selected team models are shared
+!/src/models/yolov8n.pt
+!/src/models/2026-10-10_isaac_cylinders-yolov8n-50e.pt
 
 # --- IDEs & Operating Systems ---
 .vscode/
