@@ -80,6 +80,60 @@ Output video has no audio; its format is chosen by Ultralytics for the platform.
 Use `--output` for a different output root. There is no CSV export or counting.
 IDs can change after occlusion or re-entry, so they are not a unique bottle count.
 
+### Synchronized three-camera tracking
+
+Create the folder `data/video/` (ignored by Git) and put the camera videos in
+it. There are two scripts; both take the three videos with `--videos`, and
+without it they use `14_55_back_left_cropped.mp4`, `14_55_back_right_cropped.mp4`
+and `14_55_front_cropped.mp4` from `data/video/`. Each part of the screen shows
+the name of its video file.
+
+#### Live: `tricam.py`
+
+```bash
+python src/scripts/tricam.py --overwrite --videos data/video/first.mp4 data/video/second.mp4 data/video/third.mp4
+```
+
+The script reads one frame of every camera at each step, so the views stay
+synchronized and you watch the tracking in real time; it stops when the
+shortest video ends. Every camera has its own ByteTrack tracker; a shared ID
+links the same bottle across the three views by comparing colour histograms,
+but only with bottles seen in the last `MATCH_RECENT` frames, so a new bottle
+does not take an old ID. A bottle is counted and gets its number only after it
+was seen in `MIN_FRAMES` frames, so a detection that flickers for a moment is
+not counted. The window and `src/runs/tricam/output.mp4` are split in four: the
+three annotated cameras and a panel with the bottles seen so far and the
+bottles in view now. Use `--no-display` to only save the video and `--no-save`
+to only watch it; press `q` to stop. Matching by colour can mix up bottles that
+look alike, so the counts still need manual review on real footage.
+
+#### Offline, Emilija's method: `tricam_offline.py`
+
+```bash
+python src/scripts/tricam_offline.py --videos data/video/first.mp4 data/video/second.mp4 data/video/third.mp4
+```
+
+This script first tracks the whole videos, so it is not live, but the bottles
+keep the same ID even though they all look alike:
+
+1. Every video is tracked with ByteTrack and its boxes are saved to
+   `src/runs/tricam_offline/<video name>.csv`. The next run reuses these files;
+   delete them to track again, for example after changing the weights.
+2. Only the real bottles are kept: tracks of at least `MIN_FRAMES` frames that
+   move across at least `MIN_MOVE_FRAC` of the image width.
+3. The bottles are numbered in the order they cross a line in the middle of the
+   image (`LINE_FRAC`): the n-th bottle that crosses the line gets ID n in
+   every camera.
+4. The delay of each camera is the median difference between the frames in
+   which the same bottle crosses the line. The videos are aligned by this delay
+   and saved to `src/runs/tricam_offline/output.mp4`, split in four: the three annotated
+   videos and a panel with the bottles seen so far and the bottles in view now.
+
+The script prints the number of bottles and the delay of every camera. If the
+cameras counted a different number of bottles, or many bottles have an unusual
+delay, the IDs can be shifted between the cameras. Use `--no-display` to only
+save the video; press `q` to stop.
+
 ## Checks and GitHub workflow
 
 ```bash

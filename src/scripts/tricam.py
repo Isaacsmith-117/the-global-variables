@@ -1,6 +1,9 @@
-# live + save:        python track_tricam.py
-# live only:          python track_tricam.py --no-save
-# no display + save:  python track_tricam.py --no-display
+# live + save:        python src/scripts/tricam.py
+# live only:          python src/scripts/tricam.py --no-save
+# no display + save:  python src/scripts/tricam.py --no-display
+# other videos:       python src/scripts/tricam.py --videos a.mp4 b.mp4 c.mp4
+# Live: shared IDs come from colour matching. Emilija's line-crossing method,
+# which needs the whole videos first, is in src/scripts/tricam_offline.py.
 
 
 
@@ -24,10 +27,11 @@ DEFAULT_VIDEOS = (
     "14_55_back_right_cropped.mp4",
     "14_55_front_cropped.mp4",
 )
-CAMERA_NAMES = ("back_left", "back_right", "front")
 
 MATCH_MAX_AGE = 45        # frames a global track survives without being seen
-MATCH_THRESHOLD = 0.62    # max Bhattacharyya distance to link two views
+MATCH_RECENT = 20         # a new track only links to a bottle seen in the last 20 frames
+MATCH_THRESHOLD = 0.52    # max Bhattacharyya distance to link two views
+MIN_FRAMES = 10           # a bottle is counted after it was seen in 10 frames
 COLORS = [
     (0, 220, 80), (255, 160, 0), (255, 60, 200), (0, 200, 255),
     (80, 80, 255), (200, 255, 0), (255, 255, 255), (160, 100, 255),
@@ -39,6 +43,7 @@ class GlobalIdRegistry:
 
     def __init__(self):
         self.next_id = 1
+        self.count = 0  # Confirmed bottles; each one gets the next number.
         self.local_to_global = {}
         self.tracks = {} 
         self._frame = None
@@ -58,9 +63,14 @@ class GlobalIdRegistry:
             self.next_id += 1
             self.tracks[gid] = {
                 "class_id": class_id, "feature": feature,
-                "last_seen": frame_no, "cams": set(),
+                "last_seen": None, "frames": 0, "number": None, "cams": set(),
             }
         t = self.tracks[gid]
+        if t["last_seen"] != frame_no:  # Count every frame once, not once per camera.
+            t["frames"] += 1
+        if t["number"] is None and t["frames"] >= MIN_FRAMES:  # A real bottle, not a flicker.
+            self.count += 1
+            t["number"] = self.count
         t["feature"] = feature
         t["last_seen"] = frame_no
         t["cams"].add(camera)
@@ -71,7 +81,7 @@ class GlobalIdRegistry:
         best, best_d = None, MATCH_THRESHOLD
         for gid, t in self.tracks.items():
             if (t["class_id"] != class_id or camera in t["cams"]
-                    or frame_no - t["last_seen"] > MATCH_MAX_AGE):
+                    or frame_no - t["last_seen"] > MATCH_RECENT):
                 continue
             d = cv2.compareHist(feature, t["feature"], cv2.HISTCMP_BHATTACHARYYA)
             if d < best_d:
@@ -145,18 +155,20 @@ def make_tracker(fps):
 def draw(frame, tracks, name, registry, frame_no, with_labels=True):
     """Update registry for each track; draw only when with_labels is True."""
     out = frame.copy() if with_labels else None
+    s = frame.shape[1] / 640  # Frames are shrunk to 640 wide, so scale the labels up.
     for x1, y1, x2, y2, local_id, conf, cls, _ in tracks:
         gid = registry.update(
             name, int(local_id), int(cls),
             appearance_feature(frame, (x1, y1, x2, y2)), frame_no,
         )
-        if out is None:
+        number = registry.tracks[gid]["number"]
+        if out is None or number is None:  # Only draw confirmed bottles.
             continue
-        color = COLORS[gid % len(COLORS)]
+        color = COLORS[number % len(COLORS)]
         p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
         cv2.rectangle(out, p1, p2, color, 2)
-        cv2.putText(out, f"ID {gid} {conf:.2f}", (p1[0], max(24, p1[1] - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.putText(out, f"ID {number} {conf:.2f}", (p1[0], max(int(40 * s), p1[1] - int(10 * s))),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.3 * s, color, max(2, round(3 * s)))
     if out is not None:
         cv2.putText(out, name, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 1,
                     (255, 255, 255), 2)
@@ -179,11 +191,14 @@ def parse_args(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--weights", type=Path,
                    default=root / "src/models/cosminCloud101Epochs.pt")
-    p.add_argument("--video-dir", type=Path, default=root / "data/video")
+    p.add_argument("--videos", type=Path, nargs=3,
+                   default=[root / "data/video" / name for name in DEFAULT_VIDEOS],
+                   help="the 3 synchronized videos to track")
     p.add_argument("--output", type=Path, default=root / "src/runs/tricam")
     p.add_argument("--device", default="auto", help="auto, cpu, cuda:0, mps ...")
     p.add_argument("--imgsz", type=int, default=640)
-    p.add_argument("--conf", type=float, default=0.1)
+    p.add_argument("--conf", type=float, default=0.6,
+                   help="ignore detections below this confidence")
     p.add_argument("--no-display", action="store_true",
                    help="headless mode: no windows, no drawing unless saving")
     p.add_argument("--no-save", action="store_true", help="do not write videos")
@@ -201,7 +216,7 @@ def main(argv=None):
     weights = args.weights.resolve()
     if not weights.is_file():
         raise SystemExit(f"Weights missing: {weights}")
-    paths = [(args.video_dir / n).resolve() for n in DEFAULT_VIDEOS]
+    paths = [path.resolve() for path in args.videos]
     for path in paths:
         if not path.is_file():
             raise SystemExit(f"Video missing: {path}")
@@ -223,14 +238,13 @@ def main(argv=None):
     trackers = [make_tracker(fps) for _ in readers]
     registry = GlobalIdRegistry()
 
-    writers = []
+    # output.mp4 is split in 4 parts: the 3 annotated cameras and an info panel.
+    tile_w = 640
+    tile_h = round(tile_w * readers[0].height / readers[0].width)
+    writer = None
     if save:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writers = [
-            cv2.VideoWriter(str(out_dir / f"{name}.mp4"), fourcc, fps,
-                            (r.width, r.height))
-            for name, r in zip(CAMERA_NAMES, readers)
-        ]
+        writer = cv2.VideoWriter(str(out_dir / "output.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
+                                 fps, (2 * tile_w, 2 * tile_h))
 
     dummy = [np.zeros((r.height, r.width, 3), np.uint8) for r in readers]
     model.predict(dummy, imgsz=args.imgsz, device=device, half=half, verbose=False)
@@ -248,16 +262,34 @@ def main(argv=None):
                 half=half, verbose=False,
             )
 
+            tiles = []
             for i, (img, res) in enumerate(zip(images, results)):
                 tracks = trackers[i].update(res.boxes.cpu(), img)
-                annotated = draw(img, tracks, CAMERA_NAMES[i], registry,
+                annotated = draw(img, tracks, paths[i].stem, registry,
                                  frame_no, with_labels=draw_needed)
-                if save:
-                    writers[i].write(annotated)
-                if show:
-                    cv2.imshow(f"Camera: {CAMERA_NAMES[i]}", annotated)
+                if draw_needed:
+                    tiles.append(cv2.resize(annotated, (tile_w, tile_h)))
 
+            # Different confirmed bottles seen so far and seen in these 3 frames.
+            seen_so_far = registry.count
+            in_view = sum(t["last_seen"] == frame_no and t["number"] is not None
+                          for t in registry.tracks.values())
             registry.cleanup(frame_no)
+
+            if draw_needed:
+                panel = np.zeros((tile_h, tile_w, 3), np.uint8)
+                lines = [f"Frame {frame_no + 1}",
+                         f"Bottles seen so far: {seen_so_far}",
+                         f"Bottles in view now: {in_view}"]
+                for n, line in enumerate(lines):
+                    cv2.putText(panel, line, (20, 50 + 45 * n), cv2.FONT_HERSHEY_SIMPLEX,
+                                1, (255, 255, 255), 2)
+                grid = np.vstack([np.hstack(tiles[:2]), np.hstack([tiles[2], panel])])
+                if save:
+                    writer.write(grid)
+                if show:
+                    cv2.imshow("Tricam", grid)
+
             frame_no += 1
 
             if show and (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
@@ -273,15 +305,16 @@ def main(argv=None):
     finally:
         for r in readers:
             r.release()
-        for w in writers:
-            w.release()
+        if writer:
+            writer.release()
         cv2.destroyAllWindows()
 
     elapsed = max(time.perf_counter() - start, 1e-6)
     print(f"\nProcessed {frame_no} synchronized frames in {elapsed:.1f}s "
           f"({frame_no / elapsed:.1f} fps x 3 cameras)")
+    print(f"Bottles seen: {registry.count}")
     if save:
-        print(f"Annotated videos: {out_dir}")
+        print(f"Output video: {out_dir / 'output.mp4'}")
 
 
 if __name__ == "__main__":
