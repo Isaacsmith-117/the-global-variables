@@ -4,19 +4,17 @@ from pathlib import Path
 from ultralytics import YOLO
 
 if __package__:
-    from .model import BATCH_SIZE, DATA_YAML, IMAGE_SIZE, PROJECT_ROOT, select_device
+    from .config import BATCH_SIZE, DATA_YAML, DEVICE_CHOICES, IMAGE_SIZE, RUNS_DIR, select_device
 else:
-    from model import BATCH_SIZE, DATA_YAML, IMAGE_SIZE, PROJECT_ROOT, select_device
+    from config import BATCH_SIZE, DATA_YAML, DEVICE_CHOICES, IMAGE_SIZE, RUNS_DIR, select_device
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate trained gas-cylinder weights.")
-    parser.add_argument("--weights", type=Path, required=True, help="Path to best.pt.")
+    parser.add_argument("--weights", type=Path, required=True, help="Trained detector weights.")
     parser.add_argument("--data", type=Path, default=DATA_YAML, help="Dataset YAML path.")
     parser.add_argument("--split", choices=("test", "val"), default="test")
-    parser.add_argument(
-        "--device", choices=("auto", "cpu", "mps", "cuda:0"), default="auto"
-    )
+    parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto")
     args = parser.parse_args(argv)
 
     weights = args.weights.resolve()
@@ -34,7 +32,7 @@ def main(argv=None):
         imgsz=IMAGE_SIZE,
         batch=BATCH_SIZE,
         device=device,
-        project=str(PROJECT_ROOT / "runs"),
+        project=str(RUNS_DIR),
         name=f"evaluate_{args.split}",
     )
     print(f"Precision: {metrics.box.mp:.4f}")
