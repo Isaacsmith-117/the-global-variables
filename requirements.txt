@@ -1,2 +1,6 @@
+numpy
+opencv-python
+pandas
+torch
 ultralytics~=8.4.171
 lap~=0.5.12
