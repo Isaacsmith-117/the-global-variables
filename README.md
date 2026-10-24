@@ -9,7 +9,7 @@ in local video using ByteTrack.
 ## Layout
 
 ```text
-src/scripts/       Training, evaluation, tracking, and shared config
+src/scripts/       Training (also on Colab), evaluation, tracking, and shared config
 src/models/        Selected shared weights
 src/runs/          Generated outputs (ignored)
 tests/             Local verification checks
@@ -79,6 +79,15 @@ Tracking processes every decoded frame and saves an annotated video under
 Output video has no audio; its format is chosen by Ultralytics for the platform.
 Use `--output` for a different output root. There is no CSV export or counting.
 IDs can change after occlusion or re-entry, so they are not a unique bottle count.
+
+### Colab training (YOLO26)
+
+`src/scripts/train_colab_yolo26.ipynb` fine-tunes YOLO26 small (`yolo26s.pt`)
+on a free Colab T4 GPU, with the same steps and settings as our first Colab
+model. Upload it to Google Drive and open it with Colab, set `DATASET_ZIP` in
+cell 4 to the dataset zip in Drive, then choose **Runtime → Run all**. Results
+are saved to `My Drive/gas_cylinders_runs/yolo26s/`; the last cell explains how
+to use `best.pt` with the scripts above. Set `MODEL = "yolo26n.pt"` for nano.
 
 ## Checks and GitHub workflow
 
