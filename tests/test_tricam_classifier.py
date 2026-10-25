@@ -40,30 +40,38 @@ class TricamClassifierTests(unittest.TestCase):
     def test_matched_views_use_rgb_and_only_one_classifier_call(self):
         frames = [12, 9, 10]
         model = predictor()
-        predictions = tricam.classify_crossings(
+        ocr = Mock()
+        ocr.read.return_value = {"readings": [], "weight_kg_candidates": [], "year_candidates": []}
+        predictions = tricam.inspect_crossings(
             model, [FakeCapture() for _ in range(3)], single_tracks(frames),
-            [[(1, f)] for f in frames], [2, -1, 0], 0, 20)
+            [[(1, f)] for f in frames], [2, -1, 0], 0, 20, ocr=ocr)
         self.assertEqual(predictions[1]["ready_frame"], 10)
         model.predict.assert_called_once()
         crops = model.predict.call_args.args[0]
         self.assertEqual(set(crops), {"front", "back_left", "back_right"})
         self.assertTrue(all(image.getpixel((0, 0)) == (0, 0, 255) for image in crops.values()))
+        self.assertEqual(ocr.read.call_count, 3)
+        for call, camera in zip(ocr.read.call_args_list, tricam.VIDEO_CAMERAS):
+            self.assertIs(call.args[0], crops[camera])
+        self.assertEqual(set(predictions[1]["ocr"]), set(tricam.VIDEO_CAMERAS))
         self.assertEqual(tricam.inspection_counts(predictions, 9, 0)["NOK"], 0)
         self.assertEqual(tricam.inspection_counts(predictions, 10, 0)["NOK"], 1)
         self.assertEqual(tricam.inspection_counts(predictions, 11, 0)["NOK"], 1)
 
     def test_mismatched_times_or_unreadable_crop_do_not_produce_ok(self):
         model = predictor()
+        ocr = Mock()
         for frames, captures in [([10, 30, 10], [FakeCapture()] * 3),
                                   ([10] * 3, [FakeCapture(), FakeCapture(False), FakeCapture()])]:
-            results = tricam.classify_crossings(model, captures, single_tracks(frames),
-                                                [[(1, f)] for f in frames], [0] * 3, 0, 40)
+            results = tricam.inspect_crossings(model, captures, single_tracks(frames),
+                                               [[(1, f)] for f in frames], [0] * 3, 0, 40, ocr=ocr)
             self.assertEqual(results[1]["status"], "INCOMPLETE")
         model.predict.assert_not_called()
+        ocr.read.assert_not_called()
 
     def test_different_camera_counts_stop_classification(self):
         with self.assertRaisesRegex(ValueError, "counts differ"):
-            tricam.classify_crossings(predictor(), [], [], [[(1, 10)], [], [(1, 10)]], [], 0, 40)
+            tricam.inspect_crossings(predictor(), [], [], [[(1, 10)], [], [(1, 10)]], [], 0, 40)
 
     def test_clip_counts_exclude_bottles_completed_before_clip(self):
         results = {1: {"status": "OK", "ready_frame": 9},
@@ -111,6 +119,28 @@ class TricamClassifierTests(unittest.TestCase):
             tiles = frame[:360]
             red = (tiles[:, :, 2] > 160) & (tiles[:, :, 1] < 120) & (tiles[:, :, 0] < 120)
             self.assertGreater(np.count_nonzero(red), 20)
+
+            ocr = Mock()
+            ocr.read.return_value = {"readings": [], "weight_kg_candidates": [13.4],
+                                     "year_candidates": [2025]}
+            with patch("src.scripts.ocr.BottleOCR", return_value=ocr) as reader:
+                output = tricam.main(["--weights", str(weights), "--videos", *map(str, videos),
+                                      "--ocr", "--tracks-dir", str(root),
+                                      "--output", str(root / "ocr-result"), "--device", "cpu", "--no-display"])
+            reader.assert_called_once_with("cpu")
+            self.assertEqual(ocr.read.call_count, 3)
+            summary = json.loads(output.with_name("predictions.json").read_text())
+            self.assertTrue(summary["ocr_enabled"])
+            self.assertIsNone(summary["checkpoint"])
+            self.assertIsNone(summary["counts"])
+            result = summary["predictions"][0]
+            self.assertEqual(result["status"], "NOT_CHECKED")
+            self.assertEqual(set(result["ocr"]), set(tricam.VIDEO_CAMERAS))
+            self.assertEqual(result["ocr"]["front"]["year_candidates"], [2025])
+            self.assertEqual(result["crops"]["front"]["track_id"], 3)
+            capture = cv2.VideoCapture(str(output))
+            self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 48)
+            capture.release()
 
 
 if __name__ == "__main__":

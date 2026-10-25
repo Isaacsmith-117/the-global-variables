@@ -7,6 +7,7 @@
 # Stage 5: compute the delay between the cameras so the videos can be played in sync.
 # Stage 6: draw the line, the boxes and the global IDs, and save output.mp4.
 # With --classifier: classify matched triplets once, then overlay OK/NOK and reasons.
+# With --ocr: read markings from those same crops and retain candidate fields.
 #
 # python src/scripts/tricam_offline.py
 # python src/scripts/tricam_offline.py --videos a.mp4 b.mp4 c.mp4 --weights w.pt
@@ -94,10 +95,10 @@ def crossings(df, width):
     return sorted(rows, key=lambda row: row[1])
 
 
-def classify_crossings(classifier, caps, tracks, events, offsets, start, end):
-    """Classify one fixed crop per camera, using only tracker boxes and image pixels."""
+def inspect_crossings(classifier, caps, tracks, events, offsets, start, end, ocr=None):
+    """Run optional visual/OCR checks on the same matched, full-resolution crops."""
     if len({len(e) for e in events}) != 1:
-        raise ValueError("Camera counts differ; check bottle matching before classification.")
+        raise ValueError("Camera counts differ; check bottle matching before inspection.")
     by_track = [dict(tuple(df.groupby("track_id"))) for df in tracks]
     predictions = {}
     for n in range(len(events[0])):
@@ -133,8 +134,13 @@ def classify_crossings(classifier, caps, tracks, events, offsets, start, end):
             boxes[camera] = {"frame": frame_index, "track_id": int(box.track_id),
                              "box": [x1, y1, x2, y2]}
         if len(crops) == 3:
-            result.update(classifier.predict(crops, gid))
+            if classifier is not None:
+                result.update(classifier.predict(crops, gid))
+            else:
+                result["status"] = "NOT_CHECKED"
             result["crops"] = boxes
+            if ocr is not None:
+                result["ocr"] = {camera: ocr.read(image) for camera, image in crops.items()}
         else:
             result["error"] = "Could not read three usable crops."
         predictions[gid] = result
@@ -161,6 +167,15 @@ def draw_tag(frame, lines, x, y, color):
                     0.55, color, 1, cv2.LINE_AA)
 
 
+def ocr_label(reading):
+    """Display tentative fields without treating extraction as an inspection decision."""
+    if reading is None:
+        return "OCR: unavailable"
+    weights = ",".join(f"{v:g}" for v in reading["weight_kg_candidates"]) or "?"
+    years = ",".join(map(str, reading["year_candidates"])) or "?"
+    return f"OCR candidates | kg: {weights} | year: {years}"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Synchronized tracking over three videos.")
     parser.add_argument("--weights", type=Path,
@@ -169,6 +184,7 @@ def main(argv=None):
                         help="the 3 videos, ordered back_left back_right front")
     parser.add_argument("--output", type=Path, default=RUNS_DIR / "tricam_offline")
     parser.add_argument("--classifier", type=Path, help="Optional trained three-view classifier checkpoint.")
+    parser.add_argument("--ocr", action="store_true", help="Read candidate bottle markings locally.")
     parser.add_argument("--demo-dirt", action="store_true",
                         help="Include the untrained dirt output at a 0.5 cutoff for a demo.")
     parser.add_argument("--tracks-dir", type=Path, help="Read existing track CSVs from this folder.")
@@ -253,14 +269,28 @@ def main(argv=None):
     if start >= end:
         raise SystemExit("Requested clip has no frames in the synchronized recordings.")
     predictions = {}
+    predictor = None
+    ocr = None
     if args.classifier:
         if __package__:
             from .classifier import BottleClassifier
         else:
             from classifier import BottleClassifier
-        print("Classifying matched bottle triplets...", flush=True)
         predictor = BottleClassifier(args.classifier, device, demo_dirt=args.demo_dirt)
-        predictions = classify_crossings(predictor, caps, tracks, events, offsets, start, end)
+    if args.ocr:
+        if __package__:
+            from .ocr import BottleOCR
+        else:
+            from ocr import BottleOCR
+        try:
+            ocr = BottleOCR(device)
+        except ModuleNotFoundError as error:
+            if error.name != "easyocr":
+                raise
+            raise SystemExit("Install requirements-ocr.txt in this Python environment.") from error
+    if args.classifier or args.ocr:
+        print("Inspecting matched bottle triplets...", flush=True)
+        predictions = inspect_crossings(predictor, caps, tracks, events, offsets, start, end, ocr)
         print(f"Prepared {len(predictions)} bottle results.", flush=True)
     for cap, offset in zip(caps, offsets):
         cap.set(cv2.CAP_PROP_POS_FRAMES, start + offset)
@@ -302,14 +332,18 @@ def main(argv=None):
                 color = COLORS[gid % len(COLORS)] if passed else GREY
                 label = f"ID {gid}" if passed else "ID ?"
                 lines = [f"{label} {r.conf:.2f}"]
+                prediction = predictions.get(gid)
+                ready = prediction is not None and t >= prediction["ready_frame"]
                 if args.classifier:
-                    prediction = predictions.get(gid)
-                    status = prediction["status"] if prediction and t >= prediction["ready_frame"] else "Inspecting"
+                    status = prediction["status"] if ready else "Inspecting"
                     color = {"OK": (60, 220, 70), "NOK": (70, 70, 255),
                              "INCOMPLETE": (0, 200, 255)}.get(status, GREY)
-                    lines = [f"ID {gid} | {status}"]
+                    lines = [f"ID {gid} | Visual: {status}"]
                     if status == "NOK":
                         lines.append(", ".join(reason.replace("_", " ") for reason in prediction["reasons"]))
+                if args.ocr:
+                    reading = prediction.get("ocr", {}).get(VIDEO_CAMERAS[i]) if ready else None
+                    lines.append(ocr_label(reading) if ready else "OCR: waiting for views")
                 x1, y1, x2, y2 = int(r.x1 * sx), int(r.y1 * sy), int(r.x2 * sx), int(r.y2 * sy)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
                 draw_tag(frame, lines, x1, y1, color)
@@ -323,7 +357,7 @@ def main(argv=None):
         lines = ["THREE-CAMERA BOTTLE INSPECTION", f"Source time: {t / fps:.1f}s"]
         if args.classifier:
             counts = inspection_counts(predictions, t, start)
-            lines += [f"Completed: {counts['OK'] + counts['NOK']}   OK: {counts['OK']}   NOK: {counts['NOK']}",
+            lines += [f"Visual checked: {counts['OK'] + counts['NOK']}   OK: {counts['OK']}   NOK: {counts['NOK']}",
                       f"Incomplete: {counts['INCOMPLETE']}"]
             completed = [p for p in predictions.values() if start <= p["ready_frame"] <= t]
             if completed:
@@ -335,6 +369,8 @@ def main(argv=None):
             lines.append("Unchecked: " + (", ".join(unchecked) if unchecked else "none"))
         else:
             lines.append(f"Bottles crossed: {len(seen)}")
+        if args.ocr:
+            lines.append("OCR: candidate markings; decision pending")
         for n, text in enumerate(lines):
             cv2.putText(panel, text, (20, 30 + 33 * n), cv2.FONT_HERSHEY_SIMPLEX,
                         0.65, (235, 235, 235), 1, cv2.LINE_AA)
@@ -353,11 +389,13 @@ def main(argv=None):
         cap.release()
     if not args.no_display:
         cv2.destroyAllWindows()
-    if args.classifier:
-        summary = {"checkpoint": str(args.classifier), "videos": [str(p) for p in args.videos],
+    if args.classifier or args.ocr:
+        summary = {"checkpoint": str(args.classifier) if args.classifier else None,
+                   "videos": [str(p) for p in args.videos],
                    "camera_order": VIDEO_CAMERAS, "offsets": offsets,
                    "start_frame": start, "end_frame": t + 1, "fps": fps,
-                   "counts": inspection_counts(predictions, t, start),
+                   "status_scope": "visual", "ocr_enabled": args.ocr,
+                   "counts": inspection_counts(predictions, t, start) if args.classifier else None,
                    "predictions": list(predictions.values()), "mode": "preprocessed integration demo"}
         summary["demo_dirt_requested"] = args.demo_dirt
         (args.output / "predictions.json").write_text(json.dumps(summary, indent=2) + "\n")

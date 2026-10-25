@@ -10,7 +10,7 @@ crops for visible rejection reasons.
 ## Layout
 
 ```text
-src/scripts/       Detector/classifier training, evaluation, tracking, and shared config
+src/scripts/       Detector/classifier training, evaluation, tracking, OCR, and shared config
 src/models/        Selected shared weights
 src/runs/          Generated outputs (ignored)
 tests/             Local verification checks
@@ -180,6 +180,63 @@ INCOMPLETE rather than OK. Counts include decisions completed during the clip.
 
 References: [MobileNetV3-Small](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.mobilenet_v3_small.html)
 and [fixed-feature transfer learning](https://docs.pytorch.org/tutorials/beginner/transfer_learning_tutorial.html).
+
+### Bottle-marking OCR (issue #20)
+
+The initial OCR reader uses pretrained [EasyOCR](https://github.com/JaidedAI/EasyOCR)
+on full-resolution bottle crops. It finds text regions and reads their characters;
+a small parser then collects explicit `kg` values and standalone four-digit years.
+For example, `13,4 kg` produces a weight candidate of `13.4`. These are candidate
+markings: a weight may be a capacity rather than tare, and a year may refer to
+manufacture rather than certification. Missing candidates remain empty lists.
+Raw text, confidence and text boxes are retained for review; confidence scores
+are not calibrated probabilities. Two-digit years, split text regions and unclear
+characters are left for later improvement.
+
+A three-view development smoke run produced text but no verified tare and
+certification-year pair. Recognition accuracy and processing speed have not
+been established; this is an initial integration for further improvement.
+
+Use a separate OCR environment so its headless OpenCV package stays separate
+from the video preview's OpenCV. Then pass one or more crops:
+
+```bash
+python3.13 -m venv src/runs/ocr/runtime
+src/runs/ocr/runtime/bin/python -m pip install -r requirements-ocr.txt
+src/runs/ocr/runtime/bin/python src/scripts/ocr.py data/prepared/ws5_14_55_v3/images/b001_front.jpg data/prepared/ws5_14_55_v3/images/b001_back_left.jpg data/prepared/ws5_14_55_v3/images/b001_back_right.jpg --output src/runs/ocr/b001.json
+```
+
+On Windows, use `Scripts/python.exe` instead of `bin/python` in the environment.
+The first invocation downloads public pretrained weights; images are processed
+locally. CPU is the portable default; `--device mps` and `--device cuda:0` are
+available. The JSON file records each source path and its text readings, with
+box coordinates relative to the crop after EXIF orientation. Existing output
+files are refused. Review the readings against the images before trusting fields.
+
+To use OCR in the three-camera pipeline, also install the base requirements in
+the OCR environment, then add `--ocr`. Use `--no-display` with headless OpenCV:
+
+```bash
+src/runs/ocr/runtime/bin/python -m pip install -r requirements.txt
+src/runs/ocr/runtime/bin/python src/scripts/tricam_offline.py --ocr --tracks-dir data/dataset/tracks --start-seconds 315 --seconds 5 --output src/runs/tricam_ocr/demo --device cpu --no-display
+```
+
+Add `--classifier` with a checkpoint to run visual inspection alongside OCR.
+`inspect_crossings` builds each matched full-resolution camera crop once and
+passes it to both readers. OCR runs once per view/bottle before rendering, not
+on every playback frame. Each bottle in `predictions.json` retains per-camera
+OCR readings and candidate fields, alongside frame/track/bottle-box provenance.
+OCR text boxes use coordinates within the corresponding oriented bottle crop.
+The overlay shows candidate weights/years; `?` means none were extracted, not
+that the physical marking is absent. Crossing images may not expose the text.
+
+Visual status and counters describe the visual classifier only (`status_scope`
+is `visual`). OCR candidates do not change OK/NOK; an overall acceptance rule is
+still pending. With OCR alone, visual status is `NOT_CHECKED` for usable matched
+triplets and visual counts are `null`. Matching errors/unusable triplets remain
+`INCOMPLETE`, and neither reader processes them. The standalone reader does not
+infer identity from filenames. For improvements, use training/development
+bottles and keep test bottles aside; a video clip may contain test bottles too.
 
 ## Checks and GitHub workflow
 

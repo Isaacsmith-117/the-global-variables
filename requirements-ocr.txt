@@ -1,0 +1,2 @@
+# Standalone OCR environment; EasyOCR supplies Torch, NumPy, Pillow and OpenCV.
+easyocr==1.7.2
