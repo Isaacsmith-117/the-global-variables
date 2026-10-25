@@ -4,12 +4,13 @@
 Emilija Rimselite, and Wood de Bock.
 
 Fine-tune YOLOv8 nano on CylinDeRS, evaluate the detector, and track cylinders
-in local video using ByteTrack.
+in local video using ByteTrack. A separate WS5 classifier checks matched bottle
+crops for visible rejection reasons.
 
 ## Layout
 
 ```text
-src/scripts/       Training (also on Colab), evaluation, tracking, and shared config
+src/scripts/       Detector/classifier training, evaluation, tracking, and shared config
 src/models/        Selected shared weights
 src/runs/          Generated outputs (ignored)
 tests/             Local verification checks
@@ -89,14 +90,106 @@ cell 4 to the dataset zip in Drive, then choose **Runtime → Run all**. Results
 are saved to `My Drive/gas_cylinders_runs/yolo26s/`; the last cell explains how
 to use `best.pt` with the scripts above. Set `MODEL = "yolo26n.pt"` for nano.
 
+### Three-view classifier (WS5, issue #17)
+
+The classifier takes three already-matched crops of one bottle: `front`,
+`back_left`, and `back_right`. It returns one `OK`/`NOK`, triggered reasons,
+and the camera views that supplied those reasons. `OK` means the enabled visual
+checks passed; it does not certify every plant requirement. The offline video
+integration below supplies matched crops and displays the results.
+
+`classifier.py` uses frozen pretrained MobileNetV3-Small features and one small
+trainable linear layer. Each crop is resized proportionally, padded to 224×224,
+and normalized. Training caches features once, then trains only the linear layer
+on CPU. `--device` controls feature extraction and prediction. This fixed-feature
+approach is an efficient baseline; fine-tuning can be considered after evaluation.
+
+The prepared folder contains `dataset.json` and a per-crop `manifest.jsonl`.
+Targets are `0`, `1`, or `null`; masks exclude unknown and disabled labels.
+Quarantine is excluded. Plant status is an evaluation reference, never a model
+input. Every bottle's three views must belong to the same split.
+
+```bash
+python src/scripts/train_classifier.py train --data data/prepared/ws5_14_55_v3
+python src/scripts/classifier.py --checkpoint src/runs/classifier/baseline/classifier.pt --front data/prepared/ws5_14_55_v3/images/b001_front.jpg --back-left data/prepared/ws5_14_55_v3/images/b001_back_left.jpg --back-right data/prepared/ws5_14_55_v3/images/b001_back_right.jpg --bottle-id 14_55:1
+```
+
+Training defaults to 20 epochs, batch size 32, AdamW at 0.001, and seed 0.
+Positive-class weights come only from training labels. The best checkpoint is
+chosen by validation loss. For each reason, take the maximum score over the three
+views; validation bottles select a threshold in 0.05 steps to maximize F2, which
+favours recall. Thresholds are saved with the checkpoint and never selected on test
+bottles. These scores are not calibrated probabilities. The default output folder
+must not already exist; use `--output src/runs/classifier/another-run` for a new run.
+The first training invocation downloads public ImageNet weights; images stay local.
+
+The current dataset enables `major_damage` and `wrong_brand_or_model`. Heavy dirt
+is disabled because it has no positive examples. Training contains only one
+damage-positive bottle and two model-positive bottles; validation has one of each.
+Performance and threshold estimates are therefore exploratory. Inference reports
+`checked_reasons` and `unchecked_reasons`, and rejects incomplete triplets.
+NOK reasons are the supported label categories, not generated explanations.
+API callers pass RGB PIL images or paths to `BottleClassifier.predict()`; convert
+OpenCV BGR crops to RGB PIL images before calling it.
+
+Evaluate only when the model and thresholds are settled:
+
+```bash
+python src/scripts/train_classifier.py evaluate --data data/prepared/ws5_14_55_v3 --checkpoint src/runs/classifier/baseline/classifier.pt
+```
+
+Evaluation reports per-reason TP/FN/FP/TN, precision/recall, unknown counts and plant
+agreement per bottle. Recall is `null` when a reason has no positive test bottles,
+as is currently the case for damage. Training opens only train/validation images;
+test evaluation is a separate command. Checkpoints and validation reports stay in
+ignored `src/runs/`; no classifier weights are selected for team use yet.
+
+### Annotated three-camera classifier video
+
+`tricam_offline.py --classifier` connects the classifier to the existing 2×2
+camera display. Video order is **back-left, back-right, front**. Each bottle is
+classified once using its three line-crossing crops. All crops come from the
+videos and tracker boxes; plant labels are not used to generate predictions.
+The display shows grey Inspecting boxes, green OK boxes, red NOK boxes with
+reasons, and a panel counting completed inspections once per bottle. Heavy dirt
+remains marked unchecked. Results appear after all three crossing crops are
+available in the synchronized playback.
+
+```bash
+python src/scripts/tricam_offline.py --classifier src/runs/classifier/smoke-20261025/classifier.pt --tracks-dir data/dataset/tracks --start-seconds 315 --seconds 45 --output src/runs/tricam_classifier/demo --device cpu --no-display
+```
+
+Without `--no-display`, a preview window is shown while rendering; press Q to stop.
+The output folder receives `output.mp4` and `predictions.json` with decisions,
+scores, evidence views, crop frames/boxes and clip counts. Existing output files
+are never overwritten. Omit `--tracks-dir` to run the detector and create tracks;
+use `--videos` to provide three other recordings. Omit `--seconds` for the full
+synchronized recording. Saved tracks must correspond to the supplied videos.
+
+For a dirt-enabled integration demo, add `--demo-dirt`. With the current two-reason
+checkpoint this includes its existing untrained dirt output at a fixed 0.5 cutoff;
+it is not evidence of dirt-detection performance. The overlay uses the normal
+`heavy dirt` reason text. Prediction JSON records `demo_only_reasons` and the run
+records `demo_dirt_requested`. The checkpoint, dataset and normal default behaviour
+are unchanged. A future checkpoint with trained dirt keeps its saved threshold.
+
+This is preprocessed playback for integration, not a held-out accuracy evaluation
+or a real-time speed claim. Matching uses crossing order and camera delays; unequal
+counts stop classification, and inconsistent timings/unreadable crops produce
+INCOMPLETE rather than OK. Counts include decisions completed during the clip.
+
+References: [MobileNetV3-Small](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.mobilenet_v3_small.html)
+and [fixed-feature transfer learning](https://docs.pytorch.org/tutorials/beginner/transfer_learning_tutorial.html).
+
 ## Checks and GitHub workflow
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-Tests cover device selection, invalid inputs, and synthetic ByteTrack ID
-continuity. Real footage still needs manual review for misses and ID switches.
+Tests cover device selection, invalid inputs, synthetic ByteTrack ID continuity,
+classifier preprocessing, masked labels, split leakage, triplet decisions and
+checkpoint loading. Real footage still needs checks for misses and ID switches.
 
 Use **Issue → personal branch → focused commits → PR → teammate review → merge**.
 Name branches `<issue-number>-<name>-<description>` and link the PR to its Issue.
