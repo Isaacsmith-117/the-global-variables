@@ -38,8 +38,20 @@ do not commit it or send it to external AI services.
 | Validation (2,246 images) | 88.0% | 78.0% | 86.4% | 61.4% |
 | Test (100 images) | 88.3% | 76.7% | 87.3% | 67.7% |
 
+- **[2026-10-24_cosmin_cylinders-yolo26s-70e.pt](src/models/2026-10-24_cosmin_cylinders-yolo26s-70e.pt):**
+  Cosmin's YOLO26 small gas-cylinder detector, saved October 24, 2026. Trained
+  from `yolo26s.pt` on CylinDeRS v1 with the Colab notebook for 70 epochs at
+  image size 480, batch size 32, seed 0, using AdamW. This is the best
+  checkpoint (epoch 65), not the final checkpoint. Scores below use image size
+  480; the scripts default to 416.
+
+| Split | Precision | Recall | mAP50 | mAP50–95 |
+| --- | ---: | ---: | ---: | ---: |
+| Validation (during training) | 92.3% | 86.1% | 92.8% | 69.7% |
+| Test (100 images) | 81.6% | 86.8% | 90.5% | 68.7% |
+
 These are CylinDeRS detector scores. Conveyor tracking accuracy, ID stability,
-and counting reliability remain unverified. Only the two selected models are
+and counting reliability remain unverified. Only the selected models above are
 shared; quick runs, fine-tuned candidates, and other checkpoints stay local.
 
 ## Setup
