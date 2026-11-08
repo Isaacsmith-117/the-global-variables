@@ -46,6 +46,7 @@ datasets/
 # Only these selected team models are shared
 !/src/models/yolov8n.pt
 !/src/models/2026-10-10_isaac_cylinders-yolov8n-50e.pt
+!/src/models/2026-10-24_cosmin_cylinders-yolo26s-70e.pt
 
 # --- IDEs & Operating Systems ---
 .vscode/
