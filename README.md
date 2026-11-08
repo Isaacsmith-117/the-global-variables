@@ -193,57 +193,74 @@ INCOMPLETE rather than OK. Counts include decisions completed during the clip.
 References: [MobileNetV3-Small](https://docs.pytorch.org/vision/stable/models/generated/torchvision.models.mobilenet_v3_small.html)
 and [fixed-feature transfer learning](https://docs.pytorch.org/tutorials/beginner/transfer_learning_tutorial.html).
 
-### Bottle-marking OCR (issue #20)
+### Bottle-marking OCR (issues #20, #23)
 
-The initial OCR reader uses pretrained [EasyOCR](https://github.com/JaidedAI/EasyOCR)
-on full-resolution bottle crops. It finds text regions and reads their characters;
-a small parser then collects explicit `kg` values and standalone four-digit years.
-For example, `13,4 kg` produces a weight candidate of `13.4`. These are candidate
-markings: a weight may be a capacity rather than tare, and a year may refer to
-manufacture rather than certification. Missing candidates remain empty lists.
-Raw text, confidence and text boxes are retained for review; confidence scores
-are not calibrated probabilities. Two-digit years, split text regions and unclear
-characters are left for later improvement.
+The OCR reader uses pretrained [EasyOCR](https://github.com/JaidedAI/EasyOCR) on
+full-resolution bottle crops. A bottle carries several markings, including more
+than one date, and tags or stickers add unrelated text. Like the bottle detector,
+an optional **field detector** therefore first finds one box per marking field;
+EasyOCR reads only inside each box, and the box class says what the value means.
+Every region is read from a grey, mildly contrast-enhanced, 2× enlarged copy; the
+original crop is not changed. Without field weights, the whole crop is read and
+`fields` stays empty: raw text is reported, but no field is guessed.
 
-A three-view development smoke run produced text but no verified tare and
-certification-year pair. Recognition accuracy and processing speed have not
-been established; this is an initial integration for further improvement.
+Field class names end in `_kg` or `_date`, for example `tare_kg`,
+`manufacture_date` and `test_date`. The suffix selects the parser: `TW 13,4 kg`
+in a `tare_kg` box gives `13.4`; `03/25`, `03/2025`, `2025/03` or `2025` in a
+`*_date` box give `2025-03` or `2025` (two-digit years 50–99 mean 19xx). Each field
+keeps its most confident box, raw text, box confidence and `value`; `null` means
+the text did not match. Which dates decide inspection is defined in #25.
+
+To train a field detector, annotate development bottle crops in Label Studio
+(#18) with one box per visible field, export in YOLO format to
+`data/ocr_fields/` with a `data.yaml`, and train with the shared script. Keep test
+bottles aside, and keep the weights in `src/runs/` until they are selected:
+
+```bash
+python src/scripts/model.py --mode full --data data/ocr_fields/data.yaml
+```
 
 Use a separate OCR environment so its headless OpenCV package stays separate
-from the video preview's OpenCV. Then pass one or more crops:
+from the video preview's OpenCV. Field weights also need the base requirements.
+Then pass one or more crops, and omit `--fields` to read whole crops:
 
 ```bash
 python3.13 -m venv src/runs/ocr/runtime
-src/runs/ocr/runtime/bin/python -m pip install -r requirements-ocr.txt
-src/runs/ocr/runtime/bin/python src/scripts/ocr.py data/prepared/ws5_14_55_v3/images/b001_front.jpg data/prepared/ws5_14_55_v3/images/b001_back_left.jpg data/prepared/ws5_14_55_v3/images/b001_back_right.jpg --output src/runs/ocr/b001.json
+src/runs/ocr/runtime/bin/python -m pip install -r requirements-ocr.txt -r requirements.txt
+src/runs/ocr/runtime/bin/python src/scripts/ocr.py data/prepared/ws5_14_55_v3/images/b001_front.jpg data/prepared/ws5_14_55_v3/images/b001_back_left.jpg data/prepared/ws5_14_55_v3/images/b001_back_right.jpg --fields src/runs/full/weights/best.pt --output src/runs/ocr/b001.json
 ```
 
 On Windows, use `Scripts/python.exe` instead of `bin/python` in the environment.
 The first invocation downloads public pretrained weights; images are processed
 locally. CPU is the portable default; `--device mps` and `--device cuda:0` are
-available. The JSON file records each source path and its text readings, with
-box coordinates relative to the crop after EXIF orientation. Existing output
-files are refused. Review the readings against the images before trusting fields.
+available. The JSON file records each source path, its text readings and fields,
+with box coordinates relative to the crop after EXIF orientation. A preview per
+crop is saved next to it (`b001.json` → `b001_previews/`): yellow text boxes with
+readings and confidence, and green field boxes with parsed values (`?` when not
+parsed). Existing outputs are refused. Confidence scores are not calibrated
+probabilities, and recognition accuracy and speed on plant crops are not yet
+established. Review the previews against the images before trusting fields.
 
-To use OCR in the three-camera pipeline, also install the base requirements in
-the OCR environment, then add `--ocr`. Use `--no-display` with headless OpenCV:
+To use OCR in the three-camera pipeline, run it from the OCR environment and
+add `--ocr`, plus `--ocr-fields` with field weights. Use `--no-display` with
+headless OpenCV:
 
 ```bash
-src/runs/ocr/runtime/bin/python -m pip install -r requirements.txt
-src/runs/ocr/runtime/bin/python src/scripts/tricam_offline.py --ocr --tracks-dir data/dataset/tracks --start-seconds 315 --seconds 5 --output src/runs/tricam_ocr/demo --device cpu --no-display
+src/runs/ocr/runtime/bin/python src/scripts/tricam_offline.py --ocr --ocr-fields src/runs/full/weights/best.pt --tracks-dir data/dataset/tracks --start-seconds 315 --seconds 5 --output src/runs/tricam_ocr/demo --device cpu --no-display
 ```
 
 Add `--classifier` with a checkpoint to run visual inspection alongside OCR.
 `inspect_crossings` builds each matched full-resolution camera crop once and
 passes it to both readers. OCR runs once per view/bottle before rendering, not
 on every playback frame. Each bottle in `predictions.json` retains per-camera
-OCR readings and candidate fields, alongside frame/track/bottle-box provenance.
-OCR text boxes use coordinates within the corresponding oriented bottle crop.
-The overlay shows candidate weights/years; `?` means none were extracted, not
-that the physical marking is absent. Crossing images may not expose the text.
+OCR readings and fields, alongside frame/track/bottle-box provenance.
+OCR boxes use coordinates within the corresponding oriented bottle crop.
+The overlay shows each field's value; `?` means its text was not parsed and
+`no fields` means no field box was found, not that the physical marking is
+absent. Crossing images may not expose the text.
 
 Visual status and counters describe the visual classifier only (`status_scope`
-is `visual`). OCR candidates do not change OK/NOK; an overall acceptance rule is
+is `visual`). OCR fields do not change OK/NOK; an overall acceptance rule is
 still pending. With OCR alone, visual status is `NOT_CHECKED` for usable matched
 triplets and visual counts are `null`. Matching errors/unusable triplets remain
 `INCOMPLETE`, and neither reader processes them. The standalone reader does not
@@ -257,8 +274,8 @@ python -m unittest discover -s tests -v
 ```
 
 Tests cover device selection, invalid inputs, synthetic ByteTrack ID continuity,
-classifier preprocessing, masked labels, split leakage, triplet decisions and
-checkpoint loading. Real footage still needs checks for misses and ID switches.
+classifier preprocessing, masked labels, split leakage, triplet decisions,
+checkpoint loading, and OCR field boxes, parsing and previews. Real footage still needs checks for misses and ID switches.
 
 Use **Issue → personal branch → focused commits → PR → teammate review → merge**.
 Name branches `<issue-number>-<name>-<description>` and link the PR to its Issue.
