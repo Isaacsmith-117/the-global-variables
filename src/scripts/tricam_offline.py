@@ -7,7 +7,7 @@
 # Stage 5: compute the delay between the cameras so the videos can be played in sync.
 # Stage 6: draw the line, the boxes and the global IDs, and save output.mp4.
 # With --classifier: classify matched triplets once, then overlay OK/NOK and reasons.
-# With --ocr: read markings from those same crops and retain candidate fields.
+# With --ocr: read markings from those same crops (field boxes with --ocr-fields).
 #
 # python src/scripts/tricam_offline.py
 # python src/scripts/tricam_offline.py --videos a.mp4 b.mp4 c.mp4 --weights w.pt
@@ -168,12 +168,12 @@ def draw_tag(frame, lines, x, y, color):
 
 
 def ocr_label(reading):
-    """Display tentative fields without treating extraction as an inspection decision."""
+    """Display parsed fields without treating them as an inspection decision."""
     if reading is None:
         return "OCR: unavailable"
-    weights = ",".join(f"{v:g}" for v in reading["weight_kg_candidates"]) or "?"
-    years = ",".join(map(str, reading["year_candidates"])) or "?"
-    return f"OCR candidates | kg: {weights} | year: {years}"
+    fields = [f"{name}: {'?' if field['value'] is None else field['value']}"
+              for name, field in reading["fields"].items()]
+    return "OCR | " + (" | ".join(fields) or "no fields")
 
 
 def main(argv=None):
@@ -184,7 +184,8 @@ def main(argv=None):
                         help="the 3 videos, ordered back_left back_right front")
     parser.add_argument("--output", type=Path, default=RUNS_DIR / "tricam_offline")
     parser.add_argument("--classifier", type=Path, help="Optional trained three-view classifier checkpoint.")
-    parser.add_argument("--ocr", action="store_true", help="Read candidate bottle markings locally.")
+    parser.add_argument("--ocr", action="store_true", help="Read bottle markings locally.")
+    parser.add_argument("--ocr-fields", type=Path, help="Optional OCR field-box detector weights.")
     parser.add_argument("--demo-dirt", action="store_true",
                         help="Include the untrained dirt output at a 0.5 cutoff for a demo.")
     parser.add_argument("--tracks-dir", type=Path, help="Read existing track CSVs from this folder.")
@@ -200,8 +201,11 @@ def main(argv=None):
         raise SystemExit("Start must be nonnegative and clip duration must be positive.")
     if args.demo_dirt and not args.classifier:
         raise SystemExit("--demo-dirt requires --classifier.")
+    if args.ocr_fields and not args.ocr:
+        raise SystemExit("--ocr-fields requires --ocr.")
 
-    for path in [args.weights, *args.videos, *([args.classifier] if args.classifier else [])]:
+    optional = [path for path in (args.classifier, args.ocr_fields) if path]
+    for path in [args.weights, *args.videos, *optional]:
         if not path.is_file():
             raise SystemExit(f"File missing: {path}")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -283,7 +287,7 @@ def main(argv=None):
         else:
             from ocr import BottleOCR
         try:
-            ocr = BottleOCR(device)
+            ocr = BottleOCR(device, args.ocr_fields)
         except ModuleNotFoundError as error:
             if error.name != "easyocr":
                 raise
@@ -370,7 +374,7 @@ def main(argv=None):
         else:
             lines.append(f"Bottles crossed: {len(seen)}")
         if args.ocr:
-            lines.append("OCR: candidate markings; decision pending")
+            lines.append("OCR: fields for review; decision pending")
         for n, text in enumerate(lines):
             cv2.putText(panel, text, (20, 30 + 33 * n), cv2.FONT_HERSHEY_SIMPLEX,
                         0.65, (235, 235, 235), 1, cv2.LINE_AA)
@@ -395,6 +399,7 @@ def main(argv=None):
                    "camera_order": VIDEO_CAMERAS, "offsets": offsets,
                    "start_frame": start, "end_frame": t + 1, "fps": fps,
                    "status_scope": "visual", "ocr_enabled": args.ocr,
+                   "ocr_fields": str(args.ocr_fields) if args.ocr_fields else None,
                    "counts": inspection_counts(predictions, t, start) if args.classifier else None,
                    "predictions": list(predictions.values()), "mode": "preprocessed integration demo"}
         summary["demo_dirt_requested"] = args.demo_dirt
