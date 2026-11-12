@@ -11,25 +11,18 @@
 #   4. writes manifest.csv with the columns of issue #17 (+ a few extra columns at the end),
 #   5. writes contacts/b001.jpg (all views of a bottle side by side) and review.html.
 #
-# The bottle numbers are only PROPOSED (n-th bottle crossing the line). Nothing is verified
-# automatically: bottle_id stays empty and match_verified is 0 until a person checks the
-# contact sheets / review.html against the spreadsheet. The reason columns stay "unknown".
+# Crossing-order spreadsheet matches are proposals. Only --matches, a CSV of reviewed
+# camera/track/frame matches, fills bottle_id and primagaz_status. Reasons stay "unknown".
 #
 # Needs: pip install openpyxl   (only to read the .xlsx spreadsheet)
 #
-# Expected layout (relative to the project root):
-#   data/video/14_55_back_left_cropped.mp4, ..._back_right_..., ..._front_...
-#   data/14_55_ground_truth_ai_app.xlsx
-#   src/models/cosminCloud101Epochs.pt
-# Files somewhere else? Pass --videos, --truth, --weights.
-#
-# python src/scripts/extract_dataset.py --pilot 16        (small pilot, OK and NOK mixed)
-# python src/scripts/extract_dataset.py                   (all bottles)
-# python src/scripts/extract_dataset.py --tracks-dir runs/tricam_offline   (use existing CSVs)
-# python src/scripts/extract_dataset.py --retrack                          (track again)
+# Pass --recording-id, --videos, --truth and a new --output folder explicitly.
+# See README.md for a command and the reviewed-match CSV format.
 
 import argparse
+import hashlib
 import html
+import json
 from pathlib import Path
 
 import cv2
@@ -38,16 +31,14 @@ import pandas as pd
 
 if __package__:
     from .config import PROJECT_ROOT
-    from .tricam_offline import DEFAULT_VIDEOS, LINE_FRAC, crossings, track_to_csv
+    from .tricam_offline import LINE_FRAC, crossings, track_to_csv
 else:
     from config import PROJECT_ROOT
-    from tricam_offline import DEFAULT_VIDEOS, LINE_FRAC, crossings, track_to_csv
+    from tricam_offline import LINE_FRAC, crossings, track_to_csv
 
 # ---- default paths, all relative to the project root (same videos as tricam_offline.py).
 # If your files are somewhere else, use the command line flags instead of editing this file.
 DEFAULT_WEIGHTS = PROJECT_ROOT / "src" / "models" / "cosminCloud101Epochs.pt"
-DEFAULT_TRUTH = PROJECT_ROOT / "data" / "14_55_ground_truth_ai_app.xlsx"
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "dataset"
 
 EDGE_MARGIN = 4      # px: a box this close to the image border counts as clipped
 SYNC_TOLERANCE = 15  # frames: a bottle whose crossing delay between cameras is further off is flagged
@@ -59,14 +50,17 @@ COLUMNS = [
     "wrong_brand_or_model", "review_status", "notes",
     "proposed_bottle_id", "spreadsheet_id", "spreadsheet_color", "clipped", "sync_dev_frames",
     "conf", "frame_path", "contact_sheet_path",
+    "candidate_source_row", "candidate_spreadsheet_id", "candidate_primagaz_status",
+    "candidate_spreadsheet_color",
 ]
 
 
 def camera_name(video, recording_id):
-    name = video.stem
-    if name.startswith(recording_id + "_"):
-        name = name[len(recording_id) + 1:]
-    return name.removesuffix("_cropped")
+    name = video.stem.removeprefix(recording_id + "_").removesuffix("_cropped")
+    if not video.stem.startswith(recording_id + "_") or name not in (
+            "front", "back_left", "back_right", "top"):
+        raise SystemExit(f"Video name does not identify a {recording_id} camera: {video.name}")
+    return name
 
 
 def cell(info, key):
@@ -88,18 +82,62 @@ def load_truth(path):
             raise SystemExit(f"Spreadsheet needs an '{col}' column, found: {list(df.columns)}")
 
     df["source_row"] = df.index + 2  # row in the sheet (row 1 is the header)
-    df["id"] = pd.to_numeric(df["id"], errors="coerce")
+    ids = pd.to_numeric(df["id"], errors="coerce")
+    if (df["id"].notna() & ids.isna()).any() or not np.isfinite(ids.dropna()).all():
+        raise SystemExit("Spreadsheet IDs must be finite integers.")
+    df["id"] = ids
     dropped = int(df["id"].isna().sum())
     if dropped:
         print(f"Skipping {dropped} spreadsheet rows without a valid id.")
     df = df.dropna(subset=["id"])
+    if df.empty or (df["id"] % 1 != 0).any() or df["id"].duplicated().any():
+        raise SystemExit("Spreadsheet IDs must be unique integers.")
 
-    # primagaz_status is kept exactly as in the sheet; status_label is only used for folder names
+    # Preserve the plant value; only reviewed matches use its label as a folder name.
     status = df["primagaz_status"]
     df["status_raw"] = status.where(status.notna(), "").astype(str)
     label = df["status_raw"].str.strip().str.lower()
     df["status_label"] = label.where(label != "", "unknown")
     return {int(r["id"]): r for r in df.to_dict("records")}
+
+
+def load_matches(path, recording_id, cameras, truth):
+    """Each CSV row is a manually reviewed link for one camera crossing."""
+    if path is None:
+        return {}
+    columns = ["recording_id", "camera_id", "track_id", "frame_index", "spreadsheet_id"]
+    df = pd.read_csv(path, dtype=str).fillna("")
+    if not set(columns) <= set(df.columns):
+        raise SystemExit(f"Matches CSV needs columns: {', '.join(columns)}")
+    matches, assigned = {}, set()
+    for row in df[columns].itertuples(index=False):
+        if row.recording_id != recording_id or row.camera_id not in cameras:
+            raise SystemExit("Matches CSV contains another recording or an unselected camera.")
+        try:
+            track, frame, spreadsheet_id = map(int, row[2:])
+        except ValueError as error:
+            raise SystemExit("Match track, frame and spreadsheet IDs must be integers.") from error
+        key = (row.camera_id, track, frame)
+        if key in matches or (row.camera_id, spreadsheet_id) in assigned:
+            raise SystemExit("Matches CSV repeats a crossing or a spreadsheet ID in one camera.")
+        if spreadsheet_id not in truth or truth[spreadsheet_id]["status_label"] not in ("ok", "nok"):
+            raise SystemExit(f"Match has no valid plant reference: {spreadsheet_id}")
+        matches[key] = spreadsheet_id
+        assigned.add((row.camera_id, spreadsheet_id))
+    return matches
+
+
+def file_info(path):
+    """Record the exact local input used by this extraction."""
+    with path.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    return {"path": str(path.resolve()), "bytes": path.stat().st_size, "sha256": digest}
+
+
+def save_image(path, image, quality=95):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if image.size == 0 or not cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, quality]):
+        raise RuntimeError(f"Could not save image: {path}")
 
 
 def sync_deviations(events):
@@ -145,7 +183,9 @@ def select_bottles(count, truth, id_offset, pilot):
     k_nok = min(len(nok), pilot // 2)
     k_ok = min(len(ok), pilot - k_nok)
     k_nok = min(len(nok), pilot - k_ok)  # top up if there are not enough OK bottles
-    return sorted(spread(nok, k_nok) + spread(ok, k_ok))
+    selected = spread(nok, k_nok) + spread(ok, k_ok)
+    remaining = [n for n in bottles if n not in selected]
+    return sorted(selected + spread(remaining, min(pilot, count) - len(selected)))
 
 
 def read_frames(video, wanted):
@@ -236,8 +276,9 @@ img {{ height:260px; max-width:100%; object-fit:contain; border:1px solid var(--
 figcaption {{ font-size:.8rem; }}
 </style></head><body>
 <h1>Dataset review</h1>
-<p>{len(cards)} bottles ({n_status['ok']} OK, {n_status['nok']} NOK), {n_flagged} with warnings.
-Bottle numbers are <b>proposed</b> (n-th bottle crossing the line) and not verified.
+<p>{len(cards)} groups ({n_status['ok']} verified OK, {n_status['nok']} verified NOK), {n_flagged} with warnings.
+Crossing-order groups and candidate spreadsheet references require review.
+Verified groups use the supplied reviewed matches. Reason labels remain pending.
 Click an image to open the full frame.</p>
 """]
     for c in cards:
@@ -256,29 +297,48 @@ Click an image to open the full frame.</p>
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="Extract the crossing frame of every bottle, per video.")
-    p.add_argument("--videos", type=Path, nargs="+", default=DEFAULT_VIDEOS)
+    p.add_argument("--videos", type=Path, nargs="+", required=True)
     p.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
     p.add_argument("--tracks-dir", type=Path, default=None,
                    help="folder with one <video name>.csv per video (default: <output>/tracks)")
     p.add_argument("--retrack", action="store_true", help="track the videos again")
-    p.add_argument("--truth", type=Path, default=DEFAULT_TRUTH, help="ground-truth spreadsheet")
-    p.add_argument("--recording-id", default="14_55")
+    p.add_argument("--truth", type=Path, required=True, help="recording's ground-truth spreadsheet")
+    p.add_argument("--recording-id", required=True)
+    p.add_argument("--matches", type=Path, help="CSV of manually reviewed camera/track/frame matches")
     p.add_argument("--id-offset", type=int, default=0,
-                   help="spreadsheet id = bottle number + this")
+                   help="candidate spreadsheet id = crossing number + this")
     p.add_argument("--pilot", type=int, default=0,
                    help="export only N bottles, half OK and half NOK (0 = all bottles)")
     p.add_argument("--pad", type=float, default=0.08, help="crop padding as a fraction of the box")
-    p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    p.add_argument("--output", type=Path, required=True, help="new output folder")
     args = p.parse_args(argv)
 
-    for path in [args.truth, *args.videos]:
+    if args.output.exists():
+        raise SystemExit("Output already exists; choose a new --output folder.")
+    if args.pilot < 0 or not np.isfinite(args.pad) or args.pad < 0:
+        raise SystemExit("Pilot count and padding must be nonnegative.")
+    if args.tracks_dir and args.retrack:
+        raise SystemExit("Use either --tracks-dir or --retrack.")
+    cams = [camera_name(video, args.recording_id) for video in args.videos]
+    if len(cams) != len(set(cams)):
+        raise SystemExit("Select each camera only once.")
+    if not args.truth.stem.startswith(args.recording_id + "_ground_truth"):
+        raise SystemExit("Workbook name does not match --recording-id.")
+    for path in [args.truth, *args.videos, *([args.matches] if args.matches else [])]:
         if not path.is_file():
-            raise SystemExit(f"File missing: {path}\n"
-                             f"Put it at that path or pass --videos / --truth (see --help).")
+            raise SystemExit(f"File missing: {path}")
     truth = load_truth(args.truth)
+    matches = load_matches(args.matches, args.recording_id, cams, truth)
+    run = {"complete": False, "recording_id": args.recording_id, "pad": args.pad,
+           "pilot": args.pilot, "id_offset": args.id_offset,
+           "extractor": file_info(Path(__file__)),
+           "truth": file_info(args.truth), "matches": file_info(args.matches) if args.matches else None,
+           "cameras": []}
+    args.output.mkdir(parents=True, exist_ok=False)
+    (args.output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
     tracks_dir = args.tracks_dir or args.output / "tracks"
-    tracks_dir.mkdir(parents=True, exist_ok=True)
-    cams = [camera_name(v, args.recording_id) for v in args.videos]
+    if not args.tracks_dir:
+        tracks_dir.mkdir()
 
     # ---- phase 1: tracks and crossing frames of every video
     tracks, events, sizes = [], [], []
@@ -291,7 +351,10 @@ def main(argv=None):
         cap.release()
 
         csv_path = tracks_dir / f"{video.stem}.csv"
-        if csv_path.is_file() and not args.retrack:
+        if args.tracks_dir and not csv_path.is_file():
+            raise SystemExit(f"Saved tracks missing: {csv_path}")
+        reused = csv_path.is_file() and not args.retrack
+        if reused:
             print(f"[{cam}] using saved tracks {csv_path}")
             df = pd.read_csv(csv_path)
         else:
@@ -299,15 +362,33 @@ def main(argv=None):
                 raise SystemExit(f"Weights missing: {args.weights}")
             print(f"[{cam}] tracking {video.name} (slow, only the first time) ...")
             df = track_to_csv(args.weights, video, csv_path)
-        if df.frame.max() >= total or df.x2.max() > w + 5:
-            print(f"[{cam}] WARNING: the CSV does not fit this video "
-                  f"(last frame {df.frame.max()} vs {total} frames, max x2 {df.x2.max():.0f} vs width {w}). "
-                  f"Use --retrack.")
+        columns = ["frame", "track_id", "x1", "y1", "x2", "y2", "conf"]
+        if not set(columns) <= set(df.columns) or df.empty:
+            raise SystemExit(f"Tracking CSV is empty or missing columns: {csv_path}")
+        df = df[columns].apply(pd.to_numeric, errors="raise")
+        if (not np.isfinite(df.to_numpy()).all() or df.duplicated(["track_id", "frame"]).any()
+                or (df[["frame", "track_id"]] % 1 != 0).any().any()
+                or df.frame.min() < 0 or df.frame.max() >= total or df.track_id.min() < 0
+                or df.x1.min() < -5 or df.y1.min() < -5 or df.x2.max() > w + 5 or df.y2.max() > h + 5
+                or (df.x2 <= df.x1).any() or (df.y2 <= df.y1).any()
+                or not df.conf.between(0, 1).all()):
+            raise SystemExit(f"Tracking CSV does not fit this video: {csv_path}")
         e = crossings(df, w)
         print(f"[{cam}] {len(e)} bottles")
         tracks.append(df)
         events.append(e)
         sizes.append((w, h))
+        run["cameras"].append({"camera_id": cam, "video": file_info(video),
+                               "tracks": file_info(csv_path), "crossings": len(e),
+                               "width": w, "height": h, "frames": total,
+                               "reused_tracks": reused,
+                               "weights": None if reused else file_info(args.weights)})
+        (args.output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+
+    crossing_keys = {(cam, int(track), frame) for cam, camera_events in zip(cams, events)
+                     for track, frame in camera_events}
+    if set(matches) - crossing_keys:
+        raise SystemExit("Matches CSV refers to a track/frame that is not a crossing in these videos.")
 
     if min(len(e) for e in events) == 0:
         raise SystemExit("A camera found 0 bottles, nothing to export.")
@@ -334,28 +415,26 @@ def main(argv=None):
             if selected is not None and bottle not in selected:
                 continue
             if f not in images:
-                print(f"[{cam}] could not read frame {f}")
-                continue
+                raise RuntimeError(f"Could not read {cam} frame {f}.")
             r = next(df[(df.track_id == tid) & (df.frame == f)].itertuples())
-            info = truth.get(bottle + args.id_offset)
+            candidate = truth.get(bottle + args.id_offset)
+            spreadsheet_id = matches.get((cam, int(tid), f))
+            info = truth.get(spreadsheet_id)
             label = info["status_label"] if info else "unknown"
             name = f"b{bottle:03d}_{cam}.jpg"
             frame_rel, crop_rel = f"frames/{label}/{name}", f"crops/{label}/{name}"
             for rel, img in ((frame_rel, images[f]), (crop_rel, crop_box(images[f], r, args.pad))):
-                out = args.output / rel
-                out.parent.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(out), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                save_image(args.output / rel, img)
             dbg = args.output / "debug" / cam / f"b{bottle:03d}.jpg"
-            dbg.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(dbg), debug_image(images[f], r, bottle))
+            save_image(dbg, debug_image(images[f], r, bottle))
 
             rows.append({
-                "_n": bottle,
+                "_group": (int(info is not None), spreadsheet_id if info else bottle),
                 "image_path": crop_rel, "recording_id": args.recording_id, "camera_id": cam,
-                "frame_index": f, "bottle_id": "", "track_id": tid,
+                "frame_index": f, "bottle_id": spreadsheet_id if info else "", "track_id": int(tid),
                 "source_row": f"{args.truth.name}:{info['source_row']}" if info else "",
                 "primagaz_status": cell(info, "status_raw"),
-                "match_verified": 0,
+                "match_verified": int(info is not None),
                 "major_damage": "unknown", "heavy_dirt": "unknown", "wrong_brand_or_model": "unknown",
                 "review_status": "pending", "notes": "",
                 "proposed_bottle_id": f"{args.recording_id}_b{bottle:03d}",
@@ -364,42 +443,52 @@ def main(argv=None):
                 "clipped": int(is_clipped(r, w, h)),
                 "sync_dev_frames": dev.get((bottle, i), ""),
                 "conf": r.conf, "frame_path": frame_rel, "contact_sheet_path": "",
+                "candidate_source_row": f"{args.truth.name}:{candidate['source_row']}" if candidate else "",
+                "candidate_spreadsheet_id": int(candidate["id"]) if candidate else "",
+                "candidate_primagaz_status": cell(candidate, "status_raw"),
+                "candidate_spreadsheet_color": cell(candidate, "color"),
             })
 
     # ---- phase 3: contact sheets, review page, CSV
-    rows.sort(key=lambda r: (r["_n"], r["camera_id"]))
+    rows.sort(key=lambda r: (r["_group"], r["camera_id"]))
     cards = []
-    for n in sorted({r["_n"] for r in rows}):
-        group = [r for r in rows if r["_n"] == n]
+    for n, key in enumerate(sorted({r["_group"] for r in rows}), start=1):
+        group = [r for r in rows if r["_group"] == key]
         first = group[0]
         status = first["primagaz_status"].strip().lower() or "unknown"
         devs = [r["sync_dev_frames"] for r in group if r["sync_dev_frames"] != ""]
         worst = max(devs) if devs else None
         warnings = []
-        if status not in ("ok", "nok"):
-            warnings.append("no spreadsheet row / status for this number")
+        if not first["match_verified"]:
+            warnings.append("camera grouping and spreadsheet references are proposed; review required")
+        if len(group) != len(cams):
+            warnings.append("this group is missing selected camera views")
         if any(r["clipped"] for r in group):
             warnings.append("box touches the image border in at least one view")
         if worst is not None and worst > SYNC_TOLERANCE:
             warnings.append(f"cameras disagree on the crossing time by {worst} frames, check the match")
 
         meta = (f"status {first['primagaz_status'] or '?'} · colour {first['spreadsheet_color'] or '?'} · "
-                f"spreadsheet id {first['spreadsheet_id'] or '?'} · {first['source_row'] or 'no row'}"
+                f"spreadsheet id {first['spreadsheet_id']} · {first['source_row'] or 'no row'}"
+                f" · candidate id {first['candidate_spreadsheet_id']} · "
+                f"candidate status {first['candidate_primagaz_status'] or '?'}"
                 + (f" · sync deviation {worst} frames" if worst is not None else ""))
-        title = f"{first['proposed_bottle_id']}  [{(first['primagaz_status'] or '?').upper()}]"
+        title = (f"{args.recording_id} bottle {first['bottle_id']} [VERIFIED {status.upper()}]"
+                 if first["match_verified"] else f"{first['proposed_bottle_id']} [PROPOSED]")
         sheet = make_contact_sheet(group, f"{title} | colour {first['spreadsheet_color'] or '?'} | "
                                           f"sync dev {worst if worst is not None else '?'}", args.output)
         if sheet is not None:
             rel = f"contacts/b{n:03d}.jpg"
             (args.output / "contacts").mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(args.output / rel), sheet, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            save_image(args.output / rel, sheet, quality=90)
             for r in group:
                 r["contact_sheet_path"] = rel
         cards.append({"title": title, "meta": meta, "status": status, "warnings": warnings, "rows": group})
 
-    args.output.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows, columns=COLUMNS).to_csv(args.output / "manifest.csv", index=False)
     write_review_html(args.output / "review.html", cards)
+    run.update(complete=True, crops=len(rows), verified_crops=sum(r["match_verified"] for r in rows))
+    (args.output / "run.json").write_text(json.dumps(run, indent=2) + "\n")
 
     flagged = sum(bool(c["warnings"]) for c in cards)
     print(f"Saved {len(rows)} crops of {len(cards)} bottles to {args.output}")

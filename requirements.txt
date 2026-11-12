@@ -1,6 +1,7 @@
 numpy
 opencv-python
 pandas
+openpyxl
 torch
 torchvision
 Pillow
