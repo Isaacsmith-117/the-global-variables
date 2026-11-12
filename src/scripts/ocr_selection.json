@@ -1,0 +1,15 @@
+{
+  "alpha": 0.5,
+  "fields": {
+    "tare_kg": {
+      "min_field_confidence": null,
+      "min_ocr_confidence": null,
+      "min_margin": null
+    },
+    "approval_until_date": {
+      "min_field_confidence": null,
+      "min_ocr_confidence": null,
+      "min_margin": null
+    }
+  }
+}

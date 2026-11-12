@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ import numpy as np
 from PIL import Image
 
 from src.scripts import ocr
+from src.scripts.ocr_selection import load_selection, select_fields
 
 
 class FakeReader:
@@ -36,13 +38,25 @@ def field_model(detections):
     return model
 
 
-def bottle_ocr(text, fields=None):
+def bottle_ocr(text, fields=None, selection=None):
     """Build BottleOCR with fake EasyOCR/YOLO modules, so the tests need neither."""
     easyocr, ultralytics = Mock(), Mock()
     easyocr.Reader.return_value = FakeReader(text)
     ultralytics.YOLO.return_value = fields
     with patch.dict(sys.modules, {"easyocr": easyocr, "ultralytics": ultralytics}):
-        return ocr.BottleOCR("cpu", "fields.pt" if fields else None)
+        return ocr.BottleOCR("cpu", "fields.pt" if fields else None, selection)
+
+
+def configured_selection():
+    config = load_selection()
+    for limits in config["fields"].values():
+        limits.update(min_field_confidence=0.5, min_ocr_confidence=0.5, min_margin=0.05)
+    return config
+
+
+def candidate(value, field_score, text_score):
+    return {"field": "tare_kg", "value": value, "field_confidence": field_score,
+            "ocr_confidence": text_score, "box": [8, 4, 40, 30], "source": "field_region"}
 
 
 class OCRTests(unittest.TestCase):
@@ -52,7 +66,16 @@ class OCRTests(unittest.TestCase):
                  ("test_date", "03/25", "2025-03"), ("test_date", "3-2025", "2025-03"),
                  ("manufacture_date", "2015/03", "2015-03"), ("manufacture_date", "12.2019", "2019-12"),
                  ("manufacture_date", "05/98", "1998-05"), ("test_date", "2030", "2030"),
-                 ("test_date", "13/25", None), ("test_date", "kg", None), ("serial", "2025", None)]
+                 ("test_date", "13/25", None), ("test_date", "kg", None), ("serial", "2025", None),
+                 ("tare_kg", "13..4 kg", None), ("tare_kg", "13.456 kg", None),
+                 ("tare_kg", "26.2 L", None), ("tare_kg", "A13.4", None),
+                 ("tare_kg", "13 KG NETTO", None), ("tare_kg", "13.4 10.7", None),
+                 ("tare_kg", "TARRA 10.7 KG NETTO 13 KG", 10.7),
+                 ("tare_kg", "PROPANE 13 KG TARRA 10.7", 10.7),
+                 ("test_date", "03/04/2025", None), ("test_date", "UN1965 2034", "2034"),
+                 ("test_date", "UN 1965 2034", "2034"),
+                 ("test_date", "2034 2035", None), ("test_date", "2032-02-29", "2032-02-29"),
+                 ("test_date", "2033-02-29", None), ("test_date", "2034-003-001", None)]
         for field, text, value in cases:
             with self.subTest(field=field, text=text):
                 self.assertEqual(ocr.parse_value(field, text), value)
@@ -71,22 +94,99 @@ class OCRTests(unittest.TestCase):
         self.assertEqual(reader.reader.shapes, [(800, 1200)])
         self.assertEqual(result["readings"][0]["box"][0], [2.0, 2.0])
 
-    def test_field_boxes_keep_the_best_box_and_map_text_back_to_the_crop(self):
-        model = field_model([("test_date", 0.4, [0, 0, 10, 10]), ("test_date", 0.8, [20, 10, 50, 30]),
-                             ("tare_kg", 0.7, [56, 0, 60, 8])])
-        reader = bottle_ocr("03/25", model)
-        result = reader.read(Image.new("RGB", (60, 40), "white"))
-        self.assertEqual(set(result["fields"]), {"test_date", "tare_kg"})
-        date = result["fields"]["test_date"]
-        self.assertEqual(date["box"], [16, 6, 54, 34])  # padded by 4 px, kept inside the crop
-        self.assertEqual(date["box_confidence"], 0.8)
-        self.assertEqual(date["value"], "2025-03")
-        self.assertEqual(result["fields"]["tare_kg"]["box"], [52, 0, 60, 12])
-        self.assertIn([17.0, 7.0], [token["box"][0] for token in result["readings"]])
+    def test_alternative_field_boxes_and_whole_crop_recovery(self):
+        field = "approval_until_date"
+        model = field_model([(field, 0.98, [10, 10, 40, 30]), (field, 0.8, [50, 40, 80, 65]),
+                             ("tare_kg", 0.88, [85, 5, 99, 24])])
+        reader = bottle_ocr("", model, configured_selection())
+        small = [[2, 2], [20, 2], [20, 10], [2, 10]]
+        whole_date = [[110, 90], [140, 90], [140, 110], [110, 110]]
+        reader.reader.readtext = Mock(side_effect=[
+            [(small, "UN1965", 0.99), (whole_date, "2034", 0.95)],
+            [(small, "2035", 0.15)],
+            [(small, word, score) for word, score in
+             [("TARRA", 0.99), ("10", 0.7), (",", 0.95), ("7", 0.85), ("kg", 0.99)]],
+            [],
+        ])
+        result = reader.read(Image.new("RGB", (100, 80), "white"))
+        self.assertEqual(len(result["proposals"]), 3)
+        self.assertEqual(result["readings"][0]["text"], "UN1965")
+        self.assertEqual(result["readings"][2]["box"][0], [7.0, 7.0])
+        self.assertEqual({c["value"] for c in result["candidates"]}, {10.7, "2034", "2035"})
+        chosen = result["fields"][field]
+        self.assertEqual(chosen["value"], "2034")
+        self.assertEqual(chosen["best"]["box"], [50, 40, 80, 65])
+        self.assertEqual(chosen["best"]["source"], "whole_crop")
+        self.assertEqual(chosen["best"]["field_confidence"], 0.8)
+        self.assertEqual(result["fields"]["tare_kg"]["best"]["ocr_confidence"], 0.7)
+
+    def test_ranking_uses_both_scores_and_distinct_values(self):
+        views = {"front": {"candidates": [candidate(10.7, 0.95, 0.5), candidate(10.7, 0.95, 0.5)]},
+                 "left": {"candidates": [candidate(10.7, 0.9, 0.5)]},
+                 "right": {"candidates": [candidate(13.4, 0.72, 0.95)]}}
+        config = configured_selection()
+        result = select_fields(views, config)["tare_kg"]
+        self.assertEqual(result["value"], 13.4)
+        self.assertEqual(result["alternatives"][1]["support_views"], ["front", "left"])
+        self.assertEqual(len(result["alternatives"]), 2)
+        config["fields"]["tare_kg"]["min_margin"] = 0.15
+        result = select_fields(views, config)["tare_kg"]
+        self.assertIsNone(result["value"])
+        self.assertEqual(result["status"], "ambiguous")
+        config["alpha"] = 0.9
+        config["fields"]["tare_kg"]["min_margin"] = 0.05
+        self.assertEqual(select_fields(views, config)["tare_kg"]["value"], 10.7)
+
+    def test_missing_weak_unscored_and_tied_reads_stay_unknown(self):
+        config = configured_selection()
+        config["fields"]["tare_kg"]["min_margin"] = 0
+        cases = [([], "missing"), ([candidate(10.7, None, 0.99)], "unscored"),
+                 ([candidate(10.7, 0.49, 0.99), candidate(13.4, 0.99, 0.49)], "low_confidence"),
+                 ([candidate(10.7, 0.8, 0.8), candidate(13.4, 0.8, 0.8)], "ambiguous")]
+        for observations, status in cases:
+            with self.subTest(status=status):
+                result = select_fields({"front": {"candidates": observations}}, config)["tare_kg"]
+                self.assertEqual(result["status"], status)
+                self.assertIsNone(result["value"])
+        views = {"front": {"candidates": [candidate(10.7, 0.9, 0.9)]}}
+        result = select_fields(views, load_selection())["tare_kg"]
+        self.assertEqual(result["status"], "unconfigured")
+        self.assertIsNone(result["value"])
+        self.assertEqual(result["best"]["value"], 10.7)
+        self.assertEqual(select_fields(views, config)["tare_kg"]["value"], 10.7)
+
+    def test_cache_replay_updates_selections_without_models(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "cached.json"
+            output = root / "reselected.json"
+            config = root / "selection.json"
+            config.write_text(json.dumps(configured_selection()))
+            model = field_model([("tare_kg", 0.9, [10, 10, 40, 30])])
+            reading = bottle_ocr("10.7", model).read(Image.new("RGB", (60, 40)))
+            self.assertIsNone(reading["fields"]["tare_kg"]["value"])
+            document = {"predictions": [{"status": "NOK", "ocr": {"front": reading},
+                                         "crops": {"front": {"frame": 12, "track_id": 3,
+                                                             "box": [20, 30, 80, 70]}}}]}
+            source.write_text(json.dumps(document))
+            original = source.read_bytes()
+            command = [sys.executable, "-S", str(Path(ocr.__file__).with_name("ocr_selection.py")),
+                       str(source), "--config", str(config), "--output", str(output)]
+            subprocess.run(command, check=True, capture_output=True)
+            prediction = json.loads(output.read_text())["predictions"][0]
+            self.assertEqual(prediction["status"], "NOK")
+            self.assertEqual(prediction["ocr"]["front"]["readings"], reading["readings"])
+            self.assertEqual(prediction["ocr"]["front"]["fields"]["tare_kg"]["value"], 10.7)
+            winner = prediction["ocr_fields"]["tare_kg"]["best"]
+            self.assertEqual(winner["box"], [10, 10, 40, 30])
+            self.assertEqual(winner["bottle_box"], [20, 30, 80, 70])
+            self.assertEqual((winner["camera"], winner["frame"], winner["track_id"]), ("front", 12, 3))
+            self.assertEqual(source.read_bytes(), original)
+            self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
 
     def test_preview_draws_boxes_on_a_copy(self):
         image = Image.new("RGB", (60, 40), "white")
-        result = bottle_ocr("03/25", field_model([("test_date", 0.8, [20, 10, 50, 30])])).read(image)
+        result = bottle_ocr("03/25", field_model([("approval_until_date", 0.8, [20, 10, 50, 30])])).read(image)
         preview = np.array(ocr.draw_preview(image, result))
         self.assertEqual(preview.shape, (40, 60, 3))
         self.assertTrue((preview == ocr.GREEN).all(axis=2).any())
@@ -104,6 +204,7 @@ class OCRTests(unittest.TestCase):
                     ocr.main([str(crop), "--output", str(output)])
             summary = json.loads(output.read_text(encoding="utf-8"))
             self.assertIsNone(summary["field_weights"])
+            self.assertNotIn("fields", summary)
             self.assertEqual(summary["images"][0]["readings"][0]["text"], "TW 13,4")
             self.assertTrue(Path(summary["images"][0]["preview"]).is_file())
 

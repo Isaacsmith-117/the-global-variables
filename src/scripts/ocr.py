@@ -2,41 +2,43 @@
 
 import argparse
 import json
-import re
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
+if __package__:
+    from .ocr_selection import load_selection, parse_candidates, parse_value, select_fields
+else:
+    from ocr_selection import load_selection, parse_candidates, parse_value, select_fields
+
 SCALE = 2             # small stamped characters read better when enlarged,
 ENLARGE_BELOW = 1000  # but enlarging regions this large (px) only costs memory
 PAD = 4               # pixels kept around a field box so its edge characters are not cut
-NUMBER = re.compile(r"(?<![0-9.,])([0-9]{1,2}(?:[.,][0-9]{1,2})?)(?![0-9])")
-# YYYY, YYYY/MM, MM/YY or MM/YYYY, separated by / . or -
-DATE = re.compile(r"(?<![0-9])(?:((?:19|20)[0-9]{2})(?:\s*[/.-]\s*([0-9]{1,2}))?"
-                  r"|([0-9]{1,2})\s*[/.-]\s*((?:19|20)?[0-9]{2}))(?![0-9])")
+PROPOSAL_CONFIDENCE = 0.01  # retain weak field proposals for later threshold experiments
 YELLOW, GREEN = (255, 220, 0), (0, 200, 0)
 
 
-def parse_value(field, text):
-    """Field classes end in _kg or _date; the box class gives the meaning, the text the value."""
-    if field.endswith("_kg"):
-        match = NUMBER.search(text)
-        return float(match.group(1).replace(",", ".")) if match else None
-    if field.endswith("_date"):
-        match = DATE.search(text)
-        if not match:
-            return None
-        year, month_after, month, short_year = match.groups()
-        year = int(year or short_year)
-        if year < 100:
-            year += 1900 if year >= 50 else 2000
-        month = month or month_after
-        if month is None:
-            return str(year)
-        return f"{year}-{int(month):02d}" if 1 <= int(month) <= 12 else None
-    return None
+def field_candidates(field, readings, indices, box, confidence, source):
+    """Score only the tokens used by the value, not a confidently read label or unit."""
+    text, spans = "", []
+    for index in indices:
+        token = readings[index]
+        start = len(text)
+        text += token["text"] + " "
+        spans.append((start, len(text) - 1, index))
+    candidates = []
+    for parsed in parse_candidates(field, text):
+        used = [index for start, end, index in spans if start < parsed["end"] and end > parsed["start"]]
+        points = np.concatenate([readings[index]["box"] for index in used])
+        candidates.append({"field": field, "value": parsed["value"], "value_text": parsed["value_text"],
+                           "text": text.strip(), "box": box,
+                           "value_box": [*points.min(axis=0).tolist(), *points.max(axis=0).tolist()],
+                           "field_confidence": float(confidence),
+                           "ocr_confidence": min(readings[index]["confidence"] for index in used),
+                           "reading_indices": used, "source": source})
+    return candidates
 
 
 def enhance(rgb):
@@ -50,25 +52,27 @@ def enhance(rgb):
 class BottleOCR:
     """Load the pretrained English reader (and optional field detector) once per run."""
 
-    def __init__(self, device="cpu", fields=None):
+    def __init__(self, device="cpu", fields=None, selection=None):
         import easyocr
 
         self.reader = easyocr.Reader(["en"], gpu=False if device == "cpu" else device,
                                      verbose=False)
         self.device = device
+        self.selection = selection if selection is not None else load_selection()
         self.fields = None
         if fields:
             from ultralytics import YOLO
 
             self.fields = YOLO(str(fields))
 
-    def text(self, rgb, x0=0, y0=0):
+    def text(self, rgb, x0=0, y0=0, source="whole_crop"):
         """Read one region; text boxes are returned in whole-crop coordinates."""
         tokens = []
         image, scale = enhance(rgb)
         for box, text, confidence in self.reader.readtext(image, detail=1):
             points = np.asarray(box, dtype=float) / scale + (x0, y0)
-            tokens.append({"text": text, "confidence": float(confidence), "box": points.tolist()})
+            tokens.append({"text": text, "confidence": float(confidence),
+                           "box": points.tolist(), "source": source})
         return tokens
 
     def read(self, image):
@@ -76,23 +80,34 @@ class BottleOCR:
         image = ImageOps.exif_transpose(image).convert("RGB")
         rgb = np.array(image)
         height, width = rgb.shape[:2]
-        result = {"image_size": [width, height], "readings": [], "fields": {}}
+        result = {"image_size": [width, height], "readings": self.text(rgb),
+                  "proposals": [], "candidates": [], "fields": {}}
         if self.fields is None:
-            result["readings"] = self.text(rgb)
             return result
-        found = self.fields.predict(image, device=self.device, verbose=False)[0]
+        centres = [np.mean(token["box"], axis=0) for token in result["readings"]]
+        found = self.fields.predict(image, device=self.device, conf=PROPOSAL_CONFIDENCE, verbose=False)[0]
         detections = zip(found.boxes.conf.tolist(), found.boxes.cls.tolist(), found.boxes.xyxy.tolist())
         for confidence, cls, (x1, y1, x2, y2) in sorted(detections, reverse=True):
             name = found.names[int(cls)]
-            if name in result["fields"]:
-                continue  # keep only the most confident box of each field
-            x1, y1 = max(0, int(x1) - PAD), max(0, int(y1) - PAD)
-            x2, y2 = min(width, int(x2) + PAD), min(height, int(y2) + PAD)
-            tokens = self.text(rgb[y1:y2, x1:x2], x1, y1)
-            text = " ".join(token["text"] for token in tokens)
+            x1, y1 = max(0, int(x1)), max(0, int(y1))
+            x2, y2 = min(width, int(x2)), min(height, int(y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            box = [x1, y1, x2, y2]
+            left, top = max(0, x1 - PAD), max(0, y1 - PAD)
+            right, bottom = min(width, x2 + PAD), min(height, y2 + PAD)
+            tokens = self.text(rgb[top:bottom, left:right], left, top, "field_region")
+            indices = list(range(len(result["readings"]), len(result["readings"]) + len(tokens)))
             result["readings"] += tokens
-            result["fields"][name] = {"value": parse_value(name, text), "text": text,
-                                      "box": [x1, y1, x2, y2], "box_confidence": confidence}
+            result["proposals"].append({"field": name, "box": box, "field_confidence": float(confidence),
+                                        "reading_indices": indices})
+            result["candidates"] += field_candidates(name, result["readings"], indices, box, confidence, "field_region")
+            # Whole-crop reads may recover digits missed by the focused pass. The field
+            # score is still the proposal's score; text outside every proposal stays raw.
+            inside = [index for index, (x, y) in enumerate(centres) if x1 <= x < x2 and y1 <= y < y2]
+            result["candidates"] += field_candidates(name, result["readings"], inside, box, confidence, "whole_crop")
+        if result["proposals"]:
+            result["fields"] = select_fields({"image": result}, self.selection)
         return result
 
 
@@ -105,18 +120,18 @@ def put_label(canvas, text, x, y, color):
 
 
 def draw_preview(image, result):
-    """Return a copy of the crop with text boxes (yellow) and parsed field boxes (green)."""
+    """Return a copy of the crop with text boxes (yellow) and field proposals (green)."""
     canvas = np.array(ImageOps.exif_transpose(image).convert("RGB"))
     for token in result["readings"]:
         points = np.asarray(token["box"], dtype=np.int32)
         cv2.polylines(canvas, [points], True, YELLOW, 1)
         put_label(canvas, f"{token['text']} {token['confidence']:.2f}",
                   points[0][0], max(12, points[0][1] - 3), YELLOW)
-    for name, field in result["fields"].items():
+    for field in result["proposals"]:
         x1, y1, x2, y2 = field["box"]
         cv2.rectangle(canvas, (x1, y1), (x2, y2), GREEN, 2)
-        value = "?" if field["value"] is None else field["value"]
-        put_label(canvas, f"{name}: {value}", x1, min(canvas.shape[0] - 4, y2 + 14), GREEN)
+        put_label(canvas, f"{field['field']} proposal {field['field_confidence']:.2f}",
+                  x1, min(canvas.shape[0] - 4, y2 + 14), GREEN)
     return Image.fromarray(canvas)
 
 
@@ -125,6 +140,8 @@ def main(argv=None):
     parser.add_argument("images", type=Path, nargs="+", help="Full-resolution bottle crops.")
     parser.add_argument("--output", type=Path, required=True, help="New JSON result file.")
     parser.add_argument("--fields", type=Path, help="Optional field-box detector weights.")
+    parser.add_argument("--selection-config", type=Path, help="Selection config; defaults to ocr_selection.json.")
+    parser.add_argument("--same-bottle", action="store_true", help="Explicitly combine these crops as views of one bottle.")
     parser.add_argument("--device", choices=("cpu", "mps", "cuda:0"), default="cpu")
     args = parser.parse_args(argv)
     previews = args.output.with_name(f"{args.output.stem}_previews")
@@ -136,9 +153,15 @@ def main(argv=None):
     for path in args.images:
         with Image.open(path) as image:
             image.verify()
+    if len({path.resolve() for path in args.images}) != len(args.images):
+        raise SystemExit("Select each source image only once.")
+    try:
+        selection = load_selection(args.selection_config)
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
 
     try:
-        ocr = BottleOCR(args.device, args.fields)
+        ocr = BottleOCR(args.device, args.fields, selection)
     except ModuleNotFoundError as error:
         if error.name not in ("easyocr", "ultralytics"):
             raise
@@ -155,9 +178,13 @@ def main(argv=None):
         print(f"{path.name}: {len(result['readings'])} text regions, "
               f"{len(result['fields'])} fields", flush=True)
     with args.output.open("x", encoding="utf-8") as output:
-        json.dump({"engine": "easyocr", "language": "en", "device": args.device,
+        summary = {"engine": "easyocr", "language": "en", "device": args.device,
                    "field_weights": str(args.fields) if args.fields else None,
-                   "images": results}, output, indent=2, ensure_ascii=False)
+                   "proposal_confidence": PROPOSAL_CONFIDENCE, "ocr_selection": selection,
+                   "same_bottle": args.same_bottle, "images": results}
+        if args.same_bottle:
+            summary["fields"] = select_fields({r["image_path"]: r for r in results}, selection)
+        json.dump(summary, output, indent=2, ensure_ascii=False, allow_nan=False)
         output.write("\n")
     print(f"Saved {args.output} and previews in {previews}")
 
