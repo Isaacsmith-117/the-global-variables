@@ -200,8 +200,9 @@ full-resolution bottle crops. A bottle carries several markings, including more
 than one date, and tags or stickers add unrelated text. Like the bottle detector,
 an optional **field detector** therefore first finds one box per marking field;
 EasyOCR reads only inside each box, and the box class says what the value means.
-Every region is read from a grey, mildly contrast-enhanced, 2× enlarged copy; the
-original crop is not changed. Without field weights, the whole crop is read and
+Every region is read from a grey, mildly contrast-enhanced copy, enlarged 2× when
+smaller than 1000 px (enlarging larger crops only costs memory); the original crop
+is not changed. Without field weights, the whole crop is read and
 `fields` stays empty: raw text is reported, but no field is guessed.
 
 Field class names end in `_kg` or `_date`, for example `tare_kg`,

@@ -9,8 +9,9 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-SCALE = 2  # small stamped characters read better when enlarged
-PAD = 4    # pixels kept around a field box so its edge characters are not cut
+SCALE = 2             # small stamped characters read better when enlarged,
+ENLARGE_BELOW = 1000  # but enlarging regions this large (px) only costs memory
+PAD = 4               # pixels kept around a field box so its edge characters are not cut
 NUMBER = re.compile(r"(?<![0-9.,])([0-9]{1,2}(?:[.,][0-9]{1,2})?)(?![0-9])")
 # YYYY, YYYY/MM, MM/YY or MM/YYYY, separated by / . or -
 DATE = re.compile(r"(?<![0-9])(?:((?:19|20)[0-9]{2})(?:\s*[/.-]\s*([0-9]{1,2}))?"
@@ -39,10 +40,11 @@ def parse_value(field, text):
 
 
 def enhance(rgb):
-    """Grey image with mild local contrast, enlarged; the original crop is not changed."""
+    """Grey copy with mild local contrast, enlarged if small; return it and its scale."""
     grey = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     grey = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(grey)
-    return cv2.resize(grey, None, fx=SCALE, fy=SCALE, interpolation=cv2.INTER_CUBIC)
+    scale = SCALE if max(grey.shape) < ENLARGE_BELOW else 1
+    return cv2.resize(grey, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC), scale
 
 
 class BottleOCR:
@@ -63,8 +65,9 @@ class BottleOCR:
     def text(self, rgb, x0=0, y0=0):
         """Read one region; text boxes are returned in whole-crop coordinates."""
         tokens = []
-        for box, text, confidence in self.reader.readtext(enhance(rgb), detail=1):
-            points = np.asarray(box, dtype=float) / SCALE + (x0, y0)
+        image, scale = enhance(rgb)
+        for box, text, confidence in self.reader.readtext(image, detail=1):
+            points = np.asarray(box, dtype=float) / scale + (x0, y0)
             tokens.append({"text": text, "confidence": float(confidence), "box": points.tolist()})
         return tokens
 

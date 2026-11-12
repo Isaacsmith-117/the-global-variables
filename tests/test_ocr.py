@@ -65,6 +65,12 @@ class OCRTests(unittest.TestCase):
         self.assertEqual(result["readings"][0]["box"][0], [1.0, 1.0])
         self.assertEqual(result["fields"], {})
 
+    def test_large_crops_are_not_enlarged(self):
+        reader = bottle_ocr("TW 13,4")
+        result = reader.read(Image.new("RGB", (1200, 800), "white"))
+        self.assertEqual(reader.reader.shapes, [(800, 1200)])
+        self.assertEqual(result["readings"][0]["box"][0], [2.0, 2.0])
+
     def test_field_boxes_keep_the_best_box_and_map_text_back_to_the_crop(self):
         model = field_model([("test_date", 0.4, [0, 0, 10, 10]), ("test_date", 0.8, [20, 10, 50, 30]),
                              ("tare_kg", 0.7, [56, 0, 60, 8])])
