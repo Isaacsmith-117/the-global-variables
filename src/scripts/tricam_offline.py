@@ -27,8 +27,10 @@ from PIL import Image
 
 if __package__:
     from .config import DEVICE_CHOICES, IMAGE_SIZE, PROJECT_ROOT, RUNS_DIR, select_device
+    from .ocr_selection import load_selection, select_fields
 else:
     from config import DEVICE_CHOICES, IMAGE_SIZE, PROJECT_ROOT, RUNS_DIR, select_device
+    from ocr_selection import load_selection, select_fields
 
 VIDEO_CAMERAS = ("back_left", "back_right", "front")
 DEFAULT_VIDEOS = [
@@ -141,6 +143,7 @@ def inspect_crossings(classifier, caps, tracks, events, offsets, start, end, ocr
             result["crops"] = boxes
             if ocr is not None:
                 result["ocr"] = {camera: ocr.read(image) for camera, image in crops.items()}
+                result["ocr_fields"] = select_fields(result["ocr"], ocr.selection, boxes)
         else:
             result["error"] = "Could not read three usable crops."
         predictions[gid] = result
@@ -186,6 +189,7 @@ def main(argv=None):
     parser.add_argument("--classifier", type=Path, help="Optional trained three-view classifier checkpoint.")
     parser.add_argument("--ocr", action="store_true", help="Read bottle markings locally.")
     parser.add_argument("--ocr-fields", type=Path, help="Optional OCR field-box detector weights.")
+    parser.add_argument("--ocr-selection-config", type=Path, help="OCR selection config; defaults to ocr_selection.json.")
     parser.add_argument("--demo-dirt", action="store_true",
                         help="Include the untrained dirt output at a 0.5 cutoff for a demo.")
     parser.add_argument("--tracks-dir", type=Path, help="Read existing track CSVs from this folder.")
@@ -201,8 +205,12 @@ def main(argv=None):
         raise SystemExit("Start must be nonnegative and clip duration must be positive.")
     if args.demo_dirt and not args.classifier:
         raise SystemExit("--demo-dirt requires --classifier.")
-    if args.ocr_fields and not args.ocr:
-        raise SystemExit("--ocr-fields requires --ocr.")
+    if (args.ocr_fields or args.ocr_selection_config) and not args.ocr:
+        raise SystemExit("--ocr-fields and --ocr-selection-config require --ocr.")
+    try:
+        selection = load_selection(args.ocr_selection_config) if args.ocr else None
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
 
     optional = [path for path in (args.classifier, args.ocr_fields) if path]
     for path in [args.weights, *args.videos, *optional]:
@@ -287,7 +295,7 @@ def main(argv=None):
         else:
             from ocr import BottleOCR
         try:
-            ocr = BottleOCR(device, args.ocr_fields)
+            ocr = BottleOCR(device, args.ocr_fields, selection)
         except ModuleNotFoundError as error:
             if error.name != "easyocr":
                 raise
@@ -346,7 +354,7 @@ def main(argv=None):
                     if status == "NOK":
                         lines.append(", ".join(reason.replace("_", " ") for reason in prediction["reasons"]))
                 if args.ocr:
-                    reading = prediction.get("ocr", {}).get(VIDEO_CAMERAS[i]) if ready else None
+                    reading = {"fields": prediction.get("ocr_fields", {})} if ready else None
                     lines.append(ocr_label(reading) if ready else "OCR: waiting for views")
                 x1, y1, x2, y2 = int(r.x1 * sx), int(r.y1 * sy), int(r.x2 * sx), int(r.y2 * sy)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
@@ -400,6 +408,7 @@ def main(argv=None):
                    "start_frame": start, "end_frame": t + 1, "fps": fps,
                    "status_scope": "visual", "ocr_enabled": args.ocr,
                    "ocr_fields": str(args.ocr_fields) if args.ocr_fields else None,
+                   "ocr_selection": selection,
                    "counts": inspection_counts(predictions, t, start) if args.classifier else None,
                    "predictions": list(predictions.values()), "mode": "preprocessed integration demo"}
         summary["demo_dirt_requested"] = args.demo_dirt

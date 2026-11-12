@@ -41,7 +41,8 @@ class TricamClassifierTests(unittest.TestCase):
         frames = [12, 9, 10]
         model = predictor()
         ocr = Mock()
-        ocr.read.return_value = {"readings": [], "fields": {}}
+        ocr.selection = tricam.load_selection()
+        ocr.read.return_value = {"readings": [], "fields": {}, "candidates": []}
         predictions = tricam.inspect_crossings(
             model, [FakeCapture() for _ in range(3)], single_tracks(frames),
             [[(1, f)] for f in frames], [2, -1, 0], 0, 20, ocr=ocr)
@@ -121,13 +122,22 @@ class TricamClassifierTests(unittest.TestCase):
             self.assertGreater(np.count_nonzero(red), 20)
 
             ocr = Mock()
-            ocr.read.return_value = {"readings": [], "fields": {"test_date": {
-                "value": "2025-03", "text": "03/25", "box": [0, 0, 5, 5], "box_confidence": 0.9}}}
+            ocr.selection = tricam.load_selection()
+            for limits in ocr.selection["fields"].values():
+                limits.update(min_field_confidence=0.6, min_ocr_confidence=0.6, min_margin=0.05)
+            config = root / "ocr-selection.json"
+            config.write_text(json.dumps(ocr.selection))
+            observations = [("tare_kg", 10.7, 0.95), ("approval_until_date", "2033", 0.7),
+                            ("approval_until_date", "2034", 0.95)]
+            ocr.read.side_effect = [{"readings": [], "fields": {}, "candidates": [
+                {"field": field, "value": value, "box": [0, 0, 5, 5],
+                 "field_confidence": 0.9, "ocr_confidence": score, "source": "field_region"}
+            ]} for field, value, score in observations]
             with patch("src.scripts.ocr.BottleOCR", return_value=ocr) as reader:
                 output = tricam.main(["--weights", str(weights), "--videos", *map(str, videos),
-                                      "--ocr", "--tracks-dir", str(root),
+                                      "--ocr", "--ocr-selection-config", str(config), "--tracks-dir", str(root),
                                       "--output", str(root / "ocr-result"), "--device", "cpu", "--no-display"])
-            reader.assert_called_once_with("cpu", None)
+            reader.assert_called_once_with("cpu", None, ocr.selection)
             self.assertEqual(ocr.read.call_count, 3)
             summary = json.loads(output.with_name("predictions.json").read_text())
             self.assertTrue(summary["ocr_enabled"])
@@ -136,8 +146,12 @@ class TricamClassifierTests(unittest.TestCase):
             result = summary["predictions"][0]
             self.assertEqual(result["status"], "NOT_CHECKED")
             self.assertEqual(set(result["ocr"]), set(tricam.VIDEO_CAMERAS))
-            self.assertEqual(result["ocr"]["front"]["fields"]["test_date"]["value"], "2025-03")
-            self.assertEqual(tricam.ocr_label(result["ocr"]["front"]), "OCR | test_date: 2025-03")
+            self.assertEqual(result["ocr_fields"]["tare_kg"]["best"]["camera"], "back_left")
+            date = result["ocr_fields"]["approval_until_date"]
+            self.assertEqual(date["value"], "2034")
+            self.assertEqual(date["best"]["camera"], "front")
+            self.assertEqual(date["best"]["frame"], result["crops"]["front"]["frame"])
+            self.assertEqual(date["best"]["box"], [0, 0, 5, 5])
             self.assertEqual(result["crops"]["front"]["track_id"], 3)
             capture = cv2.VideoCapture(str(output))
             self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 48)
