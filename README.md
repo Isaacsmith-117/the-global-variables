@@ -102,6 +102,47 @@ cell 4 to the dataset zip in Drive, then choose **Runtime → Run all**. Results
 are saved to `My Drive/gas_cylinders_runs/yolo26s/`; the last cell explains how
 to use `best.pt` with the scripts above. Set `MODEL = "yolo26n.pt"` for nano.
 
+### Reviewable video crop dataset (issue #32)
+
+Extract one recording at a time with explicit source paths and a new output
+folder. Video names must start with the recording ID and identify `front`,
+`back_left`, `back_right`, or `top`. The workbook name must start with the
+recording ID followed by `_ground_truth`. Its first sheet supplies the references.
+
+```bash
+python src/scripts/extract_dataset.py --recording-id 14_32 --truth data/primagaz_vids/14_32/14_32_ground_truth_ai_app.xlsx --videos data/primagaz_vids/14_32/14_32_back_left_cropped.mp4 data/primagaz_vids/14_32/14_32_back_right_cropped.mp4 data/primagaz_vids/14_32/14_32_front_cropped.mp4 --output data/derived/14_32-review-v1
+```
+
+Add `--tracks-dir` to reuse existing CSVs named after the exact video stems.
+This directory must contain every requested camera's CSV. Shape and frame checks
+reject incompatible tracks. For older CSVs, independently confirm which video
+produced them before reuse. Each run records the source and track hashes in
+`run.json`. `complete` becomes true only after the manifest and review export
+finish. A failed run keeps `complete` false; choose a fresh folder for its retry.
+Use `--pilot 16` for a small review sample selected using candidate plant labels.
+
+The output has crops, source frames, debug views, contact sheets, `manifest.csv`,
+and `review.html`. Unverified crops go in `unknown` folders. Crossing order only
+fills the `candidate_*` reference columns; `--id-offset` adjusts that proposal.
+Review camera grouping and workbook correspondence before using plant labels.
+
+To preserve reviewed matches across reruns, pass `--matches path/to/matches.csv`.
+Each row confirms one camera crossing against an ID in this recording's workbook.
+The CSV needs these columns:
+
+```csv
+recording_id,camera_id,track_id,frame_index,spreadsheet_id
+```
+
+Copy the track and frame from the review manifest and fill the workbook ID only
+after verifying the physical bottle. The extractor rejects duplicate matches,
+missing workbook IDs, and matches that do not identify a crossing in the supplied
+tracks. Confirmed rows fill `bottle_id`, `source_row`, `spreadsheet_id`, and the
+original `primagaz_status`, and set `match_verified=1`. Confirmed camera views are
+grouped by workbook ID in the review. Rejection-reason labels remain `unknown`
+and `review_status` remains `pending` for human annotation. Keep duplicates and
+all views of the same bottle together when preparing training splits.
+
 ### Three-view classifier (WS5, issue #17)
 
 The classifier takes three already-matched crops of one bottle: `front`,
