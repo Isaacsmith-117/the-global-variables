@@ -37,7 +37,7 @@ def field_candidates(field, readings, indices, box, confidence, source):
                            "value_box": [*points.min(axis=0).tolist(), *points.max(axis=0).tolist()],
                            "field_confidence": float(confidence),
                            "ocr_confidence": min(readings[index]["confidence"] for index in used),
-                           "reading_indices": used, "source": source})
+                           "reading_indices": used, "source": source, "engine": readings[used[0]]["engine"]})
     return candidates
 
 
@@ -50,7 +50,10 @@ def enhance(rgb):
 
 
 class BottleOCR:
-    """Load the pretrained English reader (and optional field detector) once per run."""
+    """Load the pretrained readers (and optional field detector) once per run.
+
+    With a field detector, PARSeq (docTR) reads each field box as a second engine.
+    """
 
     def __init__(self, device="cpu", fields=None, selection=None):
         import easyocr
@@ -61,9 +64,11 @@ class BottleOCR:
         self.selection = selection if selection is not None else load_selection()
         self.fields = None
         if fields:
+            from doctr.models import recognition_predictor
             from ultralytics import YOLO
 
             self.fields = YOLO(str(fields))
+            self.second = recognition_predictor("parseq", pretrained=True)
 
     def text(self, rgb, x0=0, y0=0, source="whole_crop"):
         """Read one region; text boxes are returned in whole-crop coordinates."""
@@ -72,7 +77,7 @@ class BottleOCR:
         for box, text, confidence in self.reader.readtext(image, detail=1):
             points = np.asarray(box, dtype=float) / scale + (x0, y0)
             tokens.append({"text": text, "confidence": float(confidence),
-                           "box": points.tolist(), "source": source})
+                           "box": points.tolist(), "source": source, "engine": "easyocr"})
         return tokens
 
     def read(self, image):
@@ -97,11 +102,17 @@ class BottleOCR:
             left, top = max(0, x1 - PAD), max(0, y1 - PAD)
             right, bottom = min(width, x2 + PAD), min(height, y2 + PAD)
             tokens = self.text(rgb[top:bottom, left:right], left, top, "field_region")
+            # PARSeq reads the same padded box as one line; its read is a separate token.
+            text, score = self.second([np.ascontiguousarray(rgb[top:bottom, left:right])])[0]
+            tokens.append({"text": text, "confidence": float(score), "source": "field_region", "engine": "parseq",
+                           "box": [[left, top], [right, top], [right, bottom], [left, bottom]]})
             indices = list(range(len(result["readings"]), len(result["readings"]) + len(tokens)))
             result["readings"] += tokens
             result["proposals"].append({"field": name, "box": box, "field_confidence": float(confidence),
                                         "reading_indices": indices})
-            result["candidates"] += field_candidates(name, result["readings"], indices, box, confidence, "field_region")
+            for engine_indices in (indices[:-1], indices[-1:]):  # EasyOCR tokens, then PARSeq
+                result["candidates"] += field_candidates(name, result["readings"], engine_indices, box,
+                                                         confidence, "field_region")
             # Whole-crop reads may recover digits missed by the focused pass. The field
             # score is still the proposal's score; text outside every proposal stays raw.
             inside = [index for index, (x, y) in enumerate(centres) if x1 <= x < x2 and y1 <= y < y2]
@@ -163,7 +174,7 @@ def main(argv=None):
     try:
         ocr = BottleOCR(args.device, args.fields, selection)
     except ModuleNotFoundError as error:
-        if error.name not in ("easyocr", "ultralytics"):
+        if error.name not in ("easyocr", "ultralytics", "doctr"):
             raise
         raise SystemExit("Install OCR dependencies: python -m pip install -r requirements-ocr.txt "
                          "(and requirements.txt for --fields)") from error

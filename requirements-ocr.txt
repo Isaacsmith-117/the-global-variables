@@ -1,2 +1,4 @@
 # Standalone OCR environment; EasyOCR supplies Torch, NumPy, Pillow and OpenCV.
 easyocr==1.7.2
+# Second reader for field boxes (PARSeq); its first use downloads public weights.
+python-doctr==1.1.0

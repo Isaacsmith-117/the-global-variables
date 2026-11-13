@@ -96,8 +96,11 @@ def load_selection(path=None):
 def select_fields(views, config, provenance=None):
     """Gate observations, group equal values, then rank by the best eligible observation.
 
-    Scores are ranking heuristics, not probabilities. Repeated reads get no vote bonus.
-    Provenance is supplied by the caller that has already matched the bottle views.
+    Scores are ranking heuristics, not probabilities. Repeated reads by one engine get no
+    vote bonus. A value read by both EasyOCR and PARSeq is agreed: it skips the OCR
+    confidence minimum, because EasyOCR can be confidently wrong, and ranks before values
+    that are not agreed. Provenance is supplied by the caller that has already matched the
+    bottle views.
     """
     selected = {}
     for field, limits in config["fields"].items():
@@ -112,9 +115,7 @@ def select_fields(views, config, provenance=None):
                     raise ValueError("Candidate confidence must be finite and in [0, 1].")
                 scored = field_score is not None and text_score is not None
                 score = field_score ** config["alpha"] * text_score ** (1 - config["alpha"]) if scored else None
-                qualified = (configured and scored and field_score >= limits["min_field_confidence"]
-                             and text_score >= limits["min_ocr_confidence"])
-                observation = {**candidate, "view": view_name, "score": score, "qualified": qualified}
+                observation = {**candidate, "view": view_name, "score": score}
                 if provenance is not None:
                     crop = provenance[view_name]
                     observation.update(camera=view_name, frame=crop["frame"], track_id=crop["track_id"],
@@ -124,14 +125,22 @@ def select_fields(views, config, provenance=None):
                 groups.setdefault(candidate["value"], []).append(observation)
         alternatives = []
         for value, observations in groups.items():
+            agreed = len({c.get("engine", "easyocr") for c in observations}) > 1
+            for c in observations:
+                c["qualified"] = (configured and c["score"] is not None
+                                  and c["field_confidence"] >= limits["min_field_confidence"]
+                                  and (agreed or c["ocr_confidence"] >= limits["min_ocr_confidence"]))
             observations.sort(key=lambda c: (c["qualified"], c["score"] if c["score"] is not None else -1), reverse=True)
             best = observations[0]
             alternatives.append({"value": value, "score": best["score"], "qualified": best["qualified"],
-                                 "support_views": sorted({c["view"] for c in observations}),
+                                 "agreed": agreed, "support_views": sorted({c["view"] for c in observations}),
                                  "observations": observations})
-        alternatives.sort(key=lambda c: (c["qualified"], c["score"] if c["score"] is not None else -1), reverse=True)
+        alternatives.sort(key=lambda c: (c["qualified"], c["agreed"], c["score"] if c["score"] is not None else -1),
+                          reverse=True)
         eligible = [c for c in alternatives if c["qualified"]]
-        margin = eligible[0]["score"] - eligible[1]["score"] if len(eligible) > 1 else None
+        # An agreed value outranks unagreed ones; the margin compares values of the same kind.
+        rivals = [c for c in eligible[1:] if c["agreed"] == eligible[0]["agreed"]]
+        margin = eligible[0]["score"] - rivals[0]["score"] if rivals else None
         if not alternatives:
             status = "missing"
         elif not configured:
