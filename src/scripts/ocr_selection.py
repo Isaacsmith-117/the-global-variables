@@ -12,6 +12,7 @@ NUMBER_EDGES = tuple(".,/+-")
 TARE_LABELS = {"t", "tw", "tara", "tarra", "tare"}
 WEIGHT_LABEL = re.compile(r"\b(?:tw|tara|tarra|tare|netto|net|butaan|propaan|butane|propane)\b", re.I)
 LIMITS = {"min_field_confidence", "min_ocr_confidence", "min_margin"}
+MIN_DATE_YEAR = 2000  # older stamped dates, e.g. manufacture years, are not candidates (#37)
 
 
 def parse_candidates(field, text):
@@ -59,6 +60,8 @@ def parse_candidates(field, text):
                     value = date.fromisoformat(raw).isoformat()
             except ValueError:
                 pass
+            if value is not None and int(value[:4]) < MIN_DATE_YEAR:
+                value = None  # the raw text stays in the readings for review
         if value is not None:
             candidates.append({"value": value, "start": match.start(), "end": match.end(),
                                "value_text": match.group()})
