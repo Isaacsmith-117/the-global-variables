@@ -50,55 +50,89 @@ def inference_checkpoints(root):
 
 
 class ClassifierTests(unittest.TestCase):
-    def test_binary_front_and_reason_outputs_share_one_feature_pass(self):
+    def test_binary_max_and_mean_use_all_three_views_and_one_feature_pass(self):
         with tempfile.TemporaryDirectory() as directory:
             reason_path, binary_path, binary = inference_checkpoints(Path(directory))
             crops = {camera: Image.new("RGB", (20, 40)) for camera in c.CAMERAS}
             for binary_format in ("instructor_visual_ok_nok_v1", "gass_binary_experiment_v1"):
                 binary.update(format=binary_format, model="mobilenet")
                 torch.save(binary, binary_path)
-                loaded = c.BottleClassifier(reason_path, binary_checkpoint=binary_path)
-                features = torch.zeros(3, loaded.model.head.in_features)
-                features[:, 0] = torch.tensor([-4, 4, 0])
-                with patch.object(loaded.model.backbone, "forward", return_value=features) as encoder:
-                    result = loaded.predict(crops)
-                encoder.assert_called_once()
-                self.assertEqual(result["status"], "OK")  # A high side-view score cannot reject.
-                self.assertEqual(result["reason_status"], "NOK")
-                self.assertEqual(result["reasons"], ["major_damage"])
-                self.assertTrue(result["reason_disagreement"])
-                self.assertFalse(result["reason_unresolved"])
-                self.assertEqual(result["decision_source"], "binary_front")
-                self.assertEqual(result["binary_threshold"], 0.5)
-                self.assertEqual(result["evidence_views"]["major_damage"], list(c.CAMERAS))
-                self.assertEqual(result["binary_scores"], dict(zip(c.CAMERAS, features[:, 0].sigmoid().tolist())))
-                with torch.no_grad():
-                    loaded.model.head.bias.fill_(-4)
-                features[0, 0] = 4
-                with patch.object(loaded.model.backbone, "forward", return_value=features):
-                    unresolved = loaded.predict(crops)
+                for aggregation in ("max", "mean"):
+                    loaded = c.BottleClassifier(reason_path, binary_checkpoint=binary_path,
+                                                binary_aggregation=aggregation)
+                    features = torch.zeros(3, loaded.model.head.in_features)
+                    features[:, 0] = torch.logit(torch.tensor([0.1, 0.9, 0.1]))
+                    with patch.object(loaded.model.backbone, "forward", return_value=features) as encoder:
+                        result = loaded.predict(crops)
+                    encoder.assert_called_once()
+                    # A single high side score rejects under max, but is diluted under mean.
+                    self.assertEqual(result["status"], "NOK" if aggregation == "max" else "OK")
+                    self.assertAlmostEqual(result["binary_score"], 0.9 if aggregation == "max" else 1.1 / 3)
+                    self.assertEqual(result["binary_aggregation"], aggregation)
+                    self.assertEqual(result["reason_status"], "NOK")
+                    self.assertEqual(result["reasons"], ["major_damage"])
+                    self.assertEqual(result["reason_disagreement"], aggregation == "mean")
+                    self.assertFalse(result["reason_unresolved"])
+                    self.assertEqual(result["decision_source"], f"binary_{aggregation}")
+                    self.assertEqual(result["binary_threshold"], 0.5)
+                    self.assertEqual(result["evidence_views"]["major_damage"], list(c.CAMERAS))
+                    self.assertEqual(result["binary_scores"], dict(zip(c.CAMERAS, features[:, 0].sigmoid().tolist())))
                     with torch.no_grad():
-                        loaded.binary_head.bias.fill_(float("nan"))
-                    with self.assertRaisesRegex(ValueError, "nonfinite scores"):
-                        loaded.predict(crops)
-                self.assertEqual(unresolved["status"], "NOK")
-                self.assertEqual(unresolved["reasons"], [])
-                self.assertTrue(unresolved["reason_unresolved"])
-                self.assertTrue(unresolved["reason_disagreement"])
-                with self.assertRaisesRegex(ValueError, "all three"):
-                    loaded.predict({"front": crops["front"]})
+                        loaded.model.head.bias.fill_(-4)
+                    features[0, 0] = 4
+                    with patch.object(loaded.model.backbone, "forward", return_value=features):
+                        unresolved = loaded.predict(crops)
+                        with torch.no_grad():
+                            loaded.binary_head.bias.fill_(float("nan"))
+                        with self.assertRaisesRegex(ValueError, "nonfinite scores"):
+                            loaded.predict(crops)
+                    self.assertEqual(unresolved["status"], "NOK")
+                    self.assertEqual(unresolved["reasons"], [])
+                    self.assertTrue(unresolved["reason_unresolved"])
+                    self.assertTrue(unresolved["reason_disagreement"])
+                    for missing in c.CAMERAS:
+                        with self.assertRaisesRegex(ValueError, "all three"):
+                            loaded.predict({name: image for name, image in crops.items() if name != missing})
+
+    def test_binary_threshold_override_and_inclusive_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reason_path, binary_path, _ = inference_checkpoints(Path(directory))
+            crops = {camera: Image.new("RGB", (20, 40)) for camera in c.CAMERAS}
+            for aggregation, cutoff, expected in [("max", 0.95, "OK"), ("mean", 0.3, "NOK"),
+                                                   ("max", 0, "NOK"), ("mean", 1, "OK")]:
+                loaded = c.BottleClassifier(reason_path, binary_checkpoint=binary_path,
+                                            binary_aggregation=aggregation, nok_threshold=cutoff)
+                features = torch.zeros(3, loaded.model.head.in_features)
+                features[:, 0] = torch.logit(torch.tensor([0.1, 0.9, 0.1]))
+                with patch.object(loaded.model.backbone, "forward", return_value=features):
+                    result = loaded.predict(crops)
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(result["binary_threshold"], cutoff)
+            for aggregation in ("max", "mean"):
+                loaded = c.BottleClassifier(reason_path, binary_checkpoint=binary_path,
+                                            binary_aggregation=aggregation)
+                with patch.object(loaded.model.backbone, "forward", return_value=torch.zeros_like(features)):
+                    self.assertEqual(loaded.predict(crops)["status"], "NOK")  # Score equals cutoff.
 
     def test_binary_checkpoint_rejects_incompatible_or_invalid_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             reason_path, binary_path, binary = inference_checkpoints(Path(directory))
             invalid = [("format", "other"), ("image_size", 640), ("positive_label", "ok"),
-                       ("threshold", 0), ("threshold", 1.1), ("threshold", float("nan")),
+                       ("threshold", -0.1), ("threshold", 1.1), ("threshold", float("nan")),
                        ("threshold", float("inf")), ("threshold", True)]
             for key, value in invalid:
                 with self.subTest(key=key, value=value):
                     torch.save({**binary, key: value}, binary_path)
                     with self.assertRaises(ValueError):
                         c.BottleClassifier(reason_path, binary_checkpoint=binary_path)
+            torch.save(binary, binary_path)
+            for cutoff in (-0.1, 1.1, float("nan"), float("inf"), True):
+                with self.assertRaises(ValueError):
+                    c.BottleClassifier(reason_path, binary_checkpoint=binary_path, nok_threshold=cutoff)
+            with self.assertRaisesRegex(ValueError, "max or mean"):
+                c.BottleClassifier(reason_path, binary_checkpoint=binary_path, binary_aggregation="front")
+            with self.assertRaisesRegex(ValueError, "require a binary checkpoint"):
+                c.BottleClassifier(reason_path, nok_threshold=0.5)
             torch.save({**binary, "format": "gass_binary_experiment_v1", "model": "efficientnet"}, binary_path)
             with self.assertRaises(ValueError):
                 c.BottleClassifier(reason_path, binary_checkpoint=binary_path)
@@ -116,6 +150,15 @@ class ClassifierTests(unittest.TestCase):
                 c.BottleClassifier(reason_path, binary_checkpoint=binary_path)
             with self.assertRaisesRegex(ValueError, "demo-dirt"):
                 c.BottleClassifier(reason_path, binary_checkpoint=binary_path, demo_dirt=True)
+
+    def test_binary_cli_configuration_requires_model_and_finite_cutoff(self):
+        images = ["--front", "a.jpg", "--back-left", "b.jpg", "--back-right", "c.jpg"]
+        for args in [["--binary-aggregation", "max"], ["--nok-threshold", "0.5"],
+                     ["--binary-checkpoint", "binary.pt", "--nok-threshold", "nan"],
+                     ["--binary-checkpoint", "binary.pt", "--binary-aggregation", "front"]]:
+            with patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                c.main(["--checkpoint", "reason.pt", *images, *args])
+            self.assertEqual(error.exception.code, 2)
 
     def test_preprocessing_preserves_both_ends_and_pads_sides(self):
         image = Image.new("RGB", (20, 100), "white")

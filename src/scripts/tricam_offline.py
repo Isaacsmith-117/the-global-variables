@@ -7,7 +7,7 @@
 # Stage 5: compute the delay between the cameras so the videos can be played in sync.
 # Stage 6: draw the line, the boxes and the global IDs, and save output.mp4.
 # With --classifier: classify matched triplets once, then overlay OK/NOK and reasons.
-# Add --binary-classifier for a front-view verdict with separate supporting reasons.
+# Add --binary-classifier for an all-view verdict with separate supporting reasons.
 # With --ocr: read markings from those same crops (field boxes with --ocr-fields).
 #
 # python src/scripts/tricam_offline.py
@@ -203,6 +203,10 @@ def main(argv=None):
     parser.add_argument("--classifier", type=Path, help="Optional trained three-view classifier checkpoint.")
     parser.add_argument("--binary-classifier", type=Path,
                         help="Optional MobileNet binary checkpoint; requires --classifier for supporting reasons.")
+    parser.add_argument("--binary-aggregation", choices=("max", "mean"),
+                        help="Combine all three NOK scores by maximum (default) or arithmetic mean.")
+    parser.add_argument("--nok-threshold", type=float,
+                        help="NOK cutoff in [0, 1]; defaults to the binary checkpoint's saved cutoff.")
     parser.add_argument("--ocr", action="store_true", help="Read bottle markings locally.")
     parser.add_argument("--ocr-fields", type=Path, help="Optional OCR field-box detector weights.")
     parser.add_argument("--ocr-selection-config", type=Path, help="OCR selection config; defaults to ocr_selection.json.")
@@ -216,6 +220,10 @@ def main(argv=None):
                         help="track again even if saved CSVs exist (use after changing weights)")
     parser.add_argument("--no-display", action="store_true", help="only save output.mp4")
     args = parser.parse_args(argv)
+    if (args.binary_aggregation is not None or args.nok_threshold is not None) and not args.binary_classifier:
+        parser.error("--binary-aggregation and --nok-threshold require --binary-classifier.")
+    if args.nok_threshold is not None and not 0 <= args.nok_threshold <= 1:
+        parser.error("--nok-threshold must be finite and between 0 and 1.")
     device = select_device() if args.device == "auto" else args.device
     if args.start_seconds < 0 or (args.seconds is not None and args.seconds <= 0):
         raise SystemExit("Start must be nonnegative and clip duration must be positive.")
@@ -307,7 +315,9 @@ def main(argv=None):
         else:
             from classifier import BottleClassifier
         predictor = BottleClassifier(args.classifier, device, demo_dirt=args.demo_dirt,
-                                     binary_checkpoint=args.binary_classifier)
+                                     binary_checkpoint=args.binary_classifier,
+                                     binary_aggregation=args.binary_aggregation or "max",
+                                     nok_threshold=args.nok_threshold)
     if args.ocr:
         if __package__:
             from .ocr import BottleOCR
@@ -386,6 +396,8 @@ def main(argv=None):
         # info panel
         panel = np.zeros((tile_h, TILE_WIDTH, 3), np.uint8)
         lines = ["THREE-CAMERA BOTTLE INSPECTION", f"Source time: {t / fps:.1f}s"]
+        if args.binary_classifier:
+            lines.append(f"Binary: {predictor.binary_aggregation}, cutoff {predictor.binary_threshold:g}")
         if args.classifier:
             counts = inspection_counts(predictions, t, start)
             lines += [f"Visual checked: {counts['OK'] + counts['NOK']}   OK: {counts['OK']}   NOK: {counts['NOK']}",
@@ -423,7 +435,9 @@ def main(argv=None):
     if args.classifier or args.ocr:
         summary = {"checkpoint": str(args.classifier) if args.classifier else None,
                    "binary_checkpoint": str(args.binary_classifier) if args.binary_classifier else None,
-                   "decision_source": "binary_front" if args.binary_classifier else "reasons" if args.classifier else None,
+                   "decision_source": f"binary_{predictor.binary_aggregation}" if args.binary_classifier else "reasons" if args.classifier else None,
+                   "binary_aggregation": predictor.binary_aggregation if args.binary_classifier else None,
+                   "binary_threshold": predictor.binary_threshold if args.binary_classifier else None,
                    "videos": [str(p) for p in args.videos],
                    "camera_order": VIDEO_CAMERAS, "offsets": offsets,
                    "start_frame": start, "end_frame": t + 1, "fps": fps,

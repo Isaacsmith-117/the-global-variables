@@ -229,9 +229,17 @@ are unchanged. A future checkpoint with trained dirt keeps its saved threshold.
 #### Independent binary verdict and supporting reasons (issue #43)
 
 Add `--binary-classifier path/to/binary.pt` alongside `--classifier path/to/reasons.pt`
-to use the binary model's saved cutoff on the **front view**. The other two binary
-scores are recorded for development review. The reason model still checks all
-three views and supplies independent findings; these never override the binary verdict.
+to use the binary model on **all three views**. Choose `--binary-aggregation max`
+(default) for the highest NOK score or `--binary-aggregation mean` for the arithmetic
+average of the three NOK scores. The combined score at or above the cutoff means
+NOK. Set `--nok-threshold 0.5` to override the checkpoint's saved cutoff; the accepted
+range is 0 to 1 inclusive. All three matched views are always required.
+
+`max` lets one high-scoring view trigger NOK; `mean` gives all three views equal
+weight, which can dilute a defect visible from only one side. Compare both rules
+and select their cutoffs on development bottles before the final recording.
+The reason model also checks all three views and supplies independent findings;
+these never override the binary verdict.
 
 Both models use the same frozen MobileNet encoder, which converts each image into
 features. Two small linear output layers read those features: one scores NOK and
@@ -240,9 +248,19 @@ sharing that computation. It accepts the MobileNet `instructor_visual_ok_nok_v1`
 and `gass_binary_experiment_v1` binary formats. For standalone crops, use
 `classifier.py --checkpoint path/to/reasons.pt --binary-checkpoint path/to/binary.pt`
 with the three existing image arguments.
+Both commands accept `--binary-aggregation` and `--nok-threshold`.
 
-JSON keeps `reason_status`, named `binary_scores`, `binary_threshold` and
-`decision_source=binary_front`. A binary NOK without a supported reason sets
+For example, add either configuration to the same development-video command:
+
+```bash
+--binary-aggregation max --nok-threshold 0.5
+--binary-aggregation mean --nok-threshold 0.5
+```
+
+JSON keeps `reason_status`, per-camera `binary_scores`, combined `binary_score`,
+`binary_aggregation`, effective `binary_threshold` and `decision_source`
+(`binary_max` or `binary_mean`). Run metadata and the video panel also show the
+rule and effective cutoff. A binary NOK without a supported reason sets
 `reason_unresolved`; different binary/reason verdicts set `reason_disagreement`.
 The overlay shows these flags and any supporting findings, including on binary OKs.
 This mode cannot use `--demo-dirt`. It is a development integration: the historical
