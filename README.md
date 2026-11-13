@@ -301,6 +301,31 @@ candidate scores saved by this version of the reader.
 python src/scripts/ocr_selection.py src/runs/ocr/b001.json --config path/to/selection.json --output src/runs/ocr/b001-reselected.json
 ```
 
+`evaluate_ocr.py` compares the combined bottle selections in a folder of bottle
+caches (from the dataset packet's `run_ocr_groups.py`) with the verified workbook
+references. With `--tune`, it replays the selection on validation bottles over a
+threshold grid and keeps, per field, the fewest wrong acceptances and then the
+most correct ones; ties take the middle setting. It writes
+`selection.validation.json` and every trial. With `--config`, it reports a frozen
+config, for example once on test bottles. Tare matches within 0.1 kg, declared
+before tuning. Dates match on the approval-until year, the workbook's precision.
+Each run saves per-bottle rows, metrics (correct, wrong, abstained, precision,
+coverage and tare error in kg) and charts. Unknown references are not scored.
+
+```bash
+python src/scripts/evaluate_ocr.py src/runs/ocr-fields/v2-pilot/validation-cache --references data/ocr_v2/ground_truth/verified_reference_values.csv --output src/runs/ocr-fields/v2-pilot/validation-report --tune
+```
+
+`evaluate_recognition.py` measures recognition without the detector. It reads the
+hand-drawn boxes that have a literal transcription, from the train and validation
+splits only. Each box is read as drawn and with a character allowlist and/or
+deskewing of rotated boxes. Results are exact text, character error rate and
+whether the parser extracts the transcribed value. Run it from the OCR environment:
+
+```bash
+src/runs/ocr/runtime/bin/python src/scripts/evaluate_recognition.py data/ocr_v2 --output src/runs/ocr-fields/recognition
+```
+
 To use OCR in the three-camera pipeline, run it from the OCR environment and
 add `--ocr`, plus `--ocr-fields` with field weights. Use `--ocr-selection-config`
 to supply validation settings and `--no-display` with headless OpenCV.
@@ -331,7 +356,8 @@ python -m unittest discover -s tests -v
 
 Tests cover device selection, invalid inputs, synthetic ByteTrack ID continuity,
 classifier preprocessing, masked labels, split leakage, triplet decisions,
-checkpoint loading, and OCR candidate parsing, selection, provenance and replay.
+checkpoint loading, OCR candidate parsing, selection, provenance and replay, and
+OCR evaluation (threshold tuning, scoring and rotated-box crops).
 Real footage still needs checks for misses and ID switches.
 
 Use **Issue → personal branch → focused commits → PR → teammate review → merge**.
