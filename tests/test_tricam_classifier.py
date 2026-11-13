@@ -37,6 +37,21 @@ def predictor():
 
 
 class TricamClassifierTests(unittest.TestCase):
+    def test_binary_options_require_reason_checkpoint_without_demo_dirt(self):
+        for args in [["--binary-classifier", "binary.pt"],
+                     ["--classifier", "reason.pt", "--binary-classifier", "binary.pt", "--demo-dirt"]]:
+            with self.assertRaisesRegex(SystemExit, "requires --classifier.*demo-dirt"):
+                tricam.main(args)
+
+    def test_binary_configuration_requires_model_and_valid_cutoff(self):
+        for args in [["--binary-aggregation", "max"], ["--nok-threshold", "0.5"],
+                     ["--binary-classifier", "binary.pt", "--nok-threshold", "nan"],
+                     ["--binary-classifier", "binary.pt", "--nok-threshold", "1.1"],
+                     ["--binary-classifier", "binary.pt", "--binary-aggregation", "front"]]:
+            with patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+                tricam.main(args)
+            self.assertEqual(error.exception.code, 2)
+
     def test_matched_views_use_rgb_and_only_one_classifier_call(self):
         frames = [12, 9, 10]
         model = predictor()
@@ -120,6 +135,41 @@ class TricamClassifierTests(unittest.TestCase):
             tiles = frame[:360]
             red = (tiles[:, :, 2] > 160) & (tiles[:, :, 1] < 120) & (tiles[:, :, 0] < 120)
             self.assertGreater(np.count_nonzero(red), 20)
+
+            binary = root / "binary.pt"
+            binary.touch()
+            for aggregation, status, reasons in [("max", "NOK", []), ("mean", "OK", ["major_damage"])]:
+                hybrid = predictor()
+                hybrid.binary_aggregation = aggregation
+                hybrid.binary_threshold = 0.7
+                hybrid.predict.return_value.update(
+                    status=status, reasons=reasons, reason_status="OK" if status == "NOK" else "NOK",
+                    decision_source=f"binary_{aggregation}", binary_scores={"front": 0.1, "back_left": 0.9, "back_right": 0.1},
+                    binary_score=0.9 if aggregation == "max" else 1.1 / 3,
+                    binary_aggregation=aggregation, binary_threshold=0.7,
+                    reason_unresolved=status == "NOK", reason_disagreement=True)
+                with patch("src.scripts.classifier.BottleClassifier", return_value=hybrid) as constructor:
+                    output = tricam.main(["--weights", str(weights), "--videos", *map(str, videos),
+                                          "--classifier", str(checkpoint), "--binary-classifier", str(binary),
+                                          "--binary-aggregation", aggregation, "--nok-threshold", "0.7",
+                                          "--tracks-dir", str(root), "--output", str(root / status),
+                                          "--device", "cpu", "--no-display"])
+                constructor.assert_called_once_with(checkpoint, "cpu", demo_dirt=False, binary_checkpoint=binary,
+                                                    binary_aggregation=aggregation, nok_threshold=0.7)
+                summary = json.loads(output.with_name("predictions.json").read_text())
+                self.assertEqual(summary["binary_checkpoint"], str(binary))
+                self.assertEqual(summary["decision_source"], f"binary_{aggregation}")
+                self.assertEqual(summary["binary_aggregation"], aggregation)
+                self.assertEqual(summary["binary_threshold"], 0.7)
+                self.assertEqual(summary["predictions"][0]["binary_aggregation"], aggregation)
+                self.assertEqual(summary["counts"][status], 1)
+                result = summary["predictions"][0]
+                self.assertEqual(result["reasons"], reasons)
+                self.assertTrue(result["reason_disagreement"])
+                self.assertEqual(result["reason_unresolved"], status == "NOK")
+                labels = tricam.reason_labels(result)
+                self.assertIn("Binary/reason disagreement", labels)
+                self.assertIn("Reason unresolved" if status == "NOK" else "Supporting: major damage", labels)
 
             ocr = Mock()
             ocr.selection = tricam.load_selection()
