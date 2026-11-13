@@ -297,7 +297,7 @@ def main(argv=None):
         try:
             ocr = BottleOCR(device, args.ocr_fields, selection)
         except ModuleNotFoundError as error:
-            if error.name != "easyocr":
+            if error.name not in ("easyocr", "doctr"):
                 raise
             raise SystemExit("Install requirements-ocr.txt in this Python environment.") from error
     if args.classifier or args.ocr:

@@ -38,12 +38,14 @@ def field_model(detections):
     return model
 
 
-def bottle_ocr(text, fields=None, selection=None):
-    """Build BottleOCR with fake EasyOCR/YOLO modules, so the tests need neither."""
-    easyocr, ultralytics = Mock(), Mock()
+def bottle_ocr(text, fields=None, selection=None, second=("", 0.0)):
+    """Build BottleOCR with fake EasyOCR/YOLO/PARSeq modules, so the tests need none of them."""
+    easyocr, ultralytics, doctr = Mock(), Mock(), Mock()
     easyocr.Reader.return_value = FakeReader(text)
     ultralytics.YOLO.return_value = fields
-    with patch.dict(sys.modules, {"easyocr": easyocr, "ultralytics": ultralytics}):
+    doctr.models.recognition_predictor.return_value = Mock(side_effect=lambda crops: [second] * len(crops))
+    modules = {"easyocr": easyocr, "ultralytics": ultralytics, "doctr": doctr, "doctr.models": doctr.models}
+    with patch.dict(sys.modules, modules):
         return ocr.BottleOCR("cpu", "fields.pt" if fields else None, selection)
 
 
@@ -140,6 +142,33 @@ class OCRTests(unittest.TestCase):
         config["alpha"] = 0.9
         config["fields"]["tare_kg"]["min_margin"] = 0.05
         self.assertEqual(select_fields(views, config)["tare_kg"]["value"], 10.7)
+
+    def test_values_read_by_both_engines_are_agreed(self):
+        config = configured_selection()
+        misread = candidate(18.7, 0.9, 1.0)  # EasyOCR, confidently wrong
+        easy, parseq = candidate(10.7, 0.9, 0.3), {**candidate(10.7, 0.9, 0.4), "engine": "parseq"}
+        result = select_fields({"front": {"candidates": [misread, easy]},
+                                "left": {"candidates": [parseq]}}, config)["tare_kg"]
+        self.assertEqual((result["value"], result["status"]), (10.7, "accepted"))
+        self.assertTrue(result["alternatives"][0]["agreed"])
+        self.assertIsNone(result["margin"])  # no other agreed value competes
+        # With one engine only, the confident misread still wins, as before.
+        self.assertEqual(select_fields({"front": {"candidates": [misread, easy]}}, config)["tare_kg"]["value"], 18.7)
+        weak_box = {**candidate(10.7, 0.4, 0.9), "engine": "parseq"}
+        result = select_fields({"front": {"candidates": [candidate(10.7, 0.4, 0.9), weak_box]}}, config)["tare_kg"]
+        self.assertEqual(result["status"], "low_confidence")  # agreement does not skip the field minimum
+
+    def test_parseq_reads_each_field_box_as_a_second_engine(self):
+        model = field_model([("tare_kg", 0.9, [10, 10, 40, 30])])
+        reader = bottle_ocr("TARE 10.7 KG", model, configured_selection(), second=("TARE 10.7KG", 0.4))
+        result = reader.read(Image.new("RGB", (60, 40), "white"))
+        parseq = [reading for reading in result["readings"] if reading["engine"] == "parseq"]
+        self.assertEqual(parseq[0]["box"], [[6, 6], [44, 6], [44, 34], [6, 34]])
+        self.assertEqual(reader.second.call_args.args[0][0].shape, (28, 38, 3))
+        self.assertEqual({c["engine"] for c in result["candidates"]}, {"easyocr", "parseq"})
+        chosen = result["fields"]["tare_kg"]
+        self.assertEqual(chosen["value"], 10.7)
+        self.assertTrue(chosen["alternatives"][0]["agreed"])
 
     def test_missing_weak_unscored_and_tied_reads_stay_unknown(self):
         config = configured_selection()

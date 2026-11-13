@@ -241,7 +241,9 @@ full-resolution bottle crops. It reads the whole crop and, with optional field
 weights, reads each proposed field box. Whole-crop text can also supply a
 candidate when its text box is centred inside a field proposal. Text elsewhere
 remains available for review. Both passes read a grey, contrast-enhanced copy
-and enlarge regions smaller than 1000 px by 2×.
+and enlarge regions smaller than 1000 px by 2×. With field weights, the pretrained
+[PARSeq](https://github.com/mindee/doctr) recognizer (docTR) also reads each padded
+field box, unchanged, as one line. Each reading and candidate records its `engine`.
 
 Use the field classes `tare_kg` and `approval_until_date`. The parser normalizes
 `TW 13,4 kg` to `13.4` and keeps year, month and day precision distinct. It accepts
@@ -258,7 +260,11 @@ with `alpha` and defines per-field minimums for both scores and the winning
 margin. After the two confidence checks, each distinct value ranks by its best
 observation using `field_confidence**alpha * ocr_confidence**(1-alpha)`. Repeated
 readings record support for a value. The score remains the best observation's
-score. The margin compares the two highest distinct qualifying values.
+score. A value read by both EasyOCR and PARSeq, in any view of the bottle, is
+`agreed`. It skips the OCR-confidence minimum but not the field minimum, and it
+ranks before values that are not agreed. On development boxes EasyOCR was often
+confidently wrong, while agreeing reads were always correct. The margin compares
+the two highest distinct qualifying values of the same kind (agreed or not).
 
 The supplied configuration uses `alpha = 0.5` and leaves the minimums unset.
 It records `best` and `alternatives` for review and leaves the accepted `value`
