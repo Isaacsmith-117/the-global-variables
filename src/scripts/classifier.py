@@ -162,12 +162,44 @@ def decide(scores, thresholds, enabled):
 class BottleClassifier:
     """Load once, then call predict with three matched RGB crops or image paths."""
 
-    def __init__(self, checkpoint, device="cpu", demo_dirt=False):
+    def __init__(self, checkpoint, device="cpu", demo_dirt=False, binary_checkpoint=None):
+        if binary_checkpoint is not None and demo_dirt:
+            raise ValueError("Binary inference cannot use the untrained --demo-dirt output.")
         state = torch.load(checkpoint, map_location="cpu", weights_only=True)
         if state["reason_order"] != list(REASONS) or state["image_size"] != IMAGE_SIZE:
             raise ValueError("Checkpoint format does not match this classifier.")
         self.model = ReasonModel()
         self.model.load_state_dict(state["model_state"])
+        self.binary_head = None
+        self.binary_threshold = None
+        if binary_checkpoint is not None:
+            binary = torch.load(binary_checkpoint, map_location="cpu", weights_only=True)
+            supported = (
+                binary.get("format") == "instructor_visual_ok_nok_v1"
+                and binary.get("backbone") == "mobilenet_v3_small"
+                and binary.get("positive_label") == "nok"
+            ) or (binary.get("format") == "gass_binary_experiment_v1"
+                  and binary.get("model") == "mobilenet")
+            if not supported or binary.get("image_size") != IMAGE_SIZE:
+                raise ValueError("Expected a supported MobileNet binary checkpoint with image size 224.")
+            threshold = binary.get("threshold")
+            if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 < threshold <= 1:
+                raise ValueError("Binary checkpoint needs a finite threshold in (0, 1].")
+            weights = binary["state_dict"]
+            expected = self.model.state_dict()
+            if set(weights) != set(expected) or any(
+                not torch.equal(value, weights[key])
+                for key, value in expected.items() if key.startswith("backbone.")
+            ):
+                raise ValueError("Binary and reason checkpoints must have identical frozen encoders.")
+            head = {key.removeprefix("head."): value for key, value in weights.items()
+                    if key.startswith("head.")}
+            if any(not torch.isfinite(value).all() for value in head.values()):
+                raise ValueError("Binary head contains nonfinite weights.")
+            self.binary_head = nn.Linear(self.model.head.in_features, 1)
+            self.binary_head.load_state_dict(head)
+            self.binary_head.to(device).eval()
+            self.binary_threshold = threshold
         self.device = device
         self.model.to(device).eval()
         self.thresholds = dict(state["thresholds"])
@@ -186,14 +218,31 @@ class BottleClassifier:
             raise ValueError("Provide all three matched views; an incomplete inspection is not OK.")
         images = [preprocess(crops[c]) if isinstance(crops[c], Image.Image)
                   else read_crop(crops[c]) for c in CAMERAS]
-        scores = self.model(torch.stack(images).to(self.device)).sigmoid().cpu()
-        return {"bottle_id": bottle_id, **decide(scores, self.thresholds, self.enabled),
-                "demo_only_reasons": self.demo_only_reasons}
+        # Both output layers use the same frozen image features.
+        features = self.model.backbone(torch.stack(images).to(self.device))
+        scores = self.model.head(features).sigmoid().cpu()
+        result = {"bottle_id": bottle_id, **decide(scores, self.thresholds, self.enabled),
+                  "demo_only_reasons": self.demo_only_reasons}
+        if self.binary_head is not None:
+            binary_scores = self.binary_head(features).sigmoid().squeeze(1).cpu()
+            if not torch.isfinite(binary_scores).all():
+                raise ValueError("Binary classifier returned nonfinite scores.")
+            view_scores = dict(zip(CAMERAS, binary_scores.tolist()))
+            status = "NOK" if view_scores["front"] >= self.binary_threshold else "OK"
+            reason_status = result["status"]
+            result.update(reason_status=reason_status, status=status,
+                          decision_source="binary_front", binary_scores=view_scores,
+                          binary_threshold=self.binary_threshold,
+                          reason_unresolved=status == "NOK" and not result["reasons"],
+                          reason_disagreement=status != reason_status)
+        return result
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Classify one matched three-view bottle.")
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--binary-checkpoint", type=Path,
+                        help="Optional MobileNet binary checkpoint; front view decides, reasons stay separate.")
     for camera in CAMERAS:
         parser.add_argument("--" + camera.replace("_", "-"), type=Path, required=True)
     parser.add_argument("--bottle-id", default=None)
@@ -201,8 +250,11 @@ def main(argv=None):
                         help="Include the untrained dirt output at a 0.5 cutoff for a demo.")
     parser.add_argument("--device", choices=DEVICE_CHOICES, default="auto")
     args = parser.parse_args(argv)
+    if args.binary_checkpoint and args.demo_dirt:
+        parser.error("--binary-checkpoint cannot be combined with --demo-dirt.")
     device = select_device() if args.device == "auto" else args.device
-    classifier = BottleClassifier(args.checkpoint, device, demo_dirt=args.demo_dirt)
+    classifier = BottleClassifier(args.checkpoint, device, demo_dirt=args.demo_dirt,
+                                  binary_checkpoint=args.binary_checkpoint)
     result = classifier.predict({c: getattr(args, c) for c in CAMERAS}, args.bottle_id)
     print(json.dumps(result, indent=2))
     return result

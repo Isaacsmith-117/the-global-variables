@@ -37,6 +37,12 @@ def predictor():
 
 
 class TricamClassifierTests(unittest.TestCase):
+    def test_binary_options_require_reason_checkpoint_without_demo_dirt(self):
+        for args in [["--binary-classifier", "binary.pt"],
+                     ["--classifier", "reason.pt", "--binary-classifier", "binary.pt", "--demo-dirt"]]:
+            with self.assertRaisesRegex(SystemExit, "requires --classifier.*demo-dirt"):
+                tricam.main(args)
+
     def test_matched_views_use_rgb_and_only_one_classifier_call(self):
         frames = [12, 9, 10]
         model = predictor()
@@ -120,6 +126,33 @@ class TricamClassifierTests(unittest.TestCase):
             tiles = frame[:360]
             red = (tiles[:, :, 2] > 160) & (tiles[:, :, 1] < 120) & (tiles[:, :, 0] < 120)
             self.assertGreater(np.count_nonzero(red), 20)
+
+            binary = root / "binary.pt"
+            binary.touch()
+            for status, reasons in [("NOK", []), ("OK", ["major_damage"])]:
+                hybrid = predictor()
+                hybrid.predict.return_value.update(
+                    status=status, reasons=reasons, reason_status="OK" if status == "NOK" else "NOK",
+                    decision_source="binary_front", binary_scores={"front": 0.8 if status == "NOK" else 0.2,
+                                                                    "back_left": 0.1, "back_right": 0.4},
+                    binary_threshold=0.5, reason_unresolved=status == "NOK", reason_disagreement=True)
+                with patch("src.scripts.classifier.BottleClassifier", return_value=hybrid) as constructor:
+                    output = tricam.main(["--weights", str(weights), "--videos", *map(str, videos),
+                                          "--classifier", str(checkpoint), "--binary-classifier", str(binary),
+                                          "--tracks-dir", str(root), "--output", str(root / status),
+                                          "--device", "cpu", "--no-display"])
+                constructor.assert_called_once_with(checkpoint, "cpu", demo_dirt=False, binary_checkpoint=binary)
+                summary = json.loads(output.with_name("predictions.json").read_text())
+                self.assertEqual(summary["binary_checkpoint"], str(binary))
+                self.assertEqual(summary["decision_source"], "binary_front")
+                self.assertEqual(summary["counts"][status], 1)
+                result = summary["predictions"][0]
+                self.assertEqual(result["reasons"], reasons)
+                self.assertTrue(result["reason_disagreement"])
+                self.assertEqual(result["reason_unresolved"], status == "NOK")
+                labels = tricam.reason_labels(result)
+                self.assertIn("Binary/reason disagreement", labels)
+                self.assertIn("Reason unresolved" if status == "NOK" else "Supporting: major damage", labels)
 
             ocr = Mock()
             ocr.selection = tricam.load_selection()

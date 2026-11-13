@@ -226,6 +226,29 @@ it is not evidence of dirt-detection performance. The overlay uses the normal
 records `demo_dirt_requested`. The checkpoint, dataset and normal default behaviour
 are unchanged. A future checkpoint with trained dirt keeps its saved threshold.
 
+#### Independent binary verdict and supporting reasons (issue #43)
+
+Add `--binary-classifier path/to/binary.pt` alongside `--classifier path/to/reasons.pt`
+to use the binary model's saved cutoff on the **front view**. The other two binary
+scores are recorded for development review. The reason model still checks all
+three views and supplies independent findings; these never override the binary verdict.
+
+Both models use the same frozen MobileNet encoder, which converts each image into
+features. Two small linear output layers read those features: one scores NOK and
+the other scores the reasons. The loader verifies that both encoders match before
+sharing that computation. It accepts the MobileNet `instructor_visual_ok_nok_v1`
+and `gass_binary_experiment_v1` binary formats. For standalone crops, use
+`classifier.py --checkpoint path/to/reasons.pt --binary-checkpoint path/to/binary.pt`
+with the three existing image arguments.
+
+JSON keeps `reason_status`, named `binary_scores`, `binary_threshold` and
+`decision_source=binary_front`. A binary NOK without a supported reason sets
+`reason_unresolved`; different binary/reason verdicts set `reason_disagreement`.
+The overlay shows these flags and any supporting findings, including on binary OKs.
+This mode cannot use `--demo-dirt`. It is a development integration: the historical
+binary checkpoint needs refitting without reserved recording photos before final
+evaluation. OCR remains a separate source of evidence in this slice.
+
 This is preprocessed playback for integration, not a held-out accuracy evaluation
 or a real-time speed claim. Matching uses crossing order and camera delays; unequal
 counts stop classification, and inconsistent timings/unreadable crops produce

@@ -27,7 +27,96 @@ def write_dataset(root, rows):
     (root / "manifest.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
 
 
+def inference_checkpoints(root):
+    """Matching synthetic encoder weights; no downloaded weights or private images."""
+    model = c.ReasonModel()
+    with torch.no_grad():
+        model.head.weight.zero_()
+        model.head.bias.fill_(-4)
+        model.head.bias[0] = 4
+    reason_path, binary_path = root / "reason.pt", root / "binary.pt"
+    torch.save({"model_state": model.state_dict(), "reason_order": list(c.REASONS),
+                "image_size": c.IMAGE_SIZE, "enabled_reasons": ["major_damage"],
+                "thresholds": {"major_damage": 0.5}}, reason_path)
+    weights = dict(model.state_dict())
+    weights["head.weight"] = torch.zeros(1, model.head.in_features)
+    weights["head.weight"][0, 0] = 1
+    weights["head.bias"] = torch.zeros(1)
+    binary = {"format": "instructor_visual_ok_nok_v1", "backbone": "mobilenet_v3_small",
+              "positive_label": "nok", "image_size": c.IMAGE_SIZE,
+              "threshold": 0.5, "state_dict": weights}
+    torch.save(binary, binary_path)
+    return reason_path, binary_path, binary
+
+
 class ClassifierTests(unittest.TestCase):
+    def test_binary_front_and_reason_outputs_share_one_feature_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reason_path, binary_path, binary = inference_checkpoints(Path(directory))
+            crops = {camera: Image.new("RGB", (20, 40)) for camera in c.CAMERAS}
+            for binary_format in ("instructor_visual_ok_nok_v1", "gass_binary_experiment_v1"):
+                binary.update(format=binary_format, model="mobilenet")
+                torch.save(binary, binary_path)
+                loaded = c.BottleClassifier(reason_path, binary_checkpoint=binary_path)
+                features = torch.zeros(3, loaded.model.head.in_features)
+                features[:, 0] = torch.tensor([-4, 4, 0])
+                with patch.object(loaded.model.backbone, "forward", return_value=features) as encoder:
+                    result = loaded.predict(crops)
+                encoder.assert_called_once()
+                self.assertEqual(result["status"], "OK")  # A high side-view score cannot reject.
+                self.assertEqual(result["reason_status"], "NOK")
+                self.assertEqual(result["reasons"], ["major_damage"])
+                self.assertTrue(result["reason_disagreement"])
+                self.assertFalse(result["reason_unresolved"])
+                self.assertEqual(result["decision_source"], "binary_front")
+                self.assertEqual(result["binary_threshold"], 0.5)
+                self.assertEqual(result["evidence_views"]["major_damage"], list(c.CAMERAS))
+                self.assertEqual(result["binary_scores"], dict(zip(c.CAMERAS, features[:, 0].sigmoid().tolist())))
+                with torch.no_grad():
+                    loaded.model.head.bias.fill_(-4)
+                features[0, 0] = 4
+                with patch.object(loaded.model.backbone, "forward", return_value=features):
+                    unresolved = loaded.predict(crops)
+                    with torch.no_grad():
+                        loaded.binary_head.bias.fill_(float("nan"))
+                    with self.assertRaisesRegex(ValueError, "nonfinite scores"):
+                        loaded.predict(crops)
+                self.assertEqual(unresolved["status"], "NOK")
+                self.assertEqual(unresolved["reasons"], [])
+                self.assertTrue(unresolved["reason_unresolved"])
+                self.assertTrue(unresolved["reason_disagreement"])
+                with self.assertRaisesRegex(ValueError, "all three"):
+                    loaded.predict({"front": crops["front"]})
+
+    def test_binary_checkpoint_rejects_incompatible_or_invalid_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reason_path, binary_path, binary = inference_checkpoints(Path(directory))
+            invalid = [("format", "other"), ("image_size", 640), ("positive_label", "ok"),
+                       ("threshold", 0), ("threshold", 1.1), ("threshold", float("nan")),
+                       ("threshold", float("inf")), ("threshold", True)]
+            for key, value in invalid:
+                with self.subTest(key=key, value=value):
+                    torch.save({**binary, key: value}, binary_path)
+                    with self.assertRaises(ValueError):
+                        c.BottleClassifier(reason_path, binary_checkpoint=binary_path)
+            torch.save({**binary, "format": "gass_binary_experiment_v1", "model": "efficientnet"}, binary_path)
+            with self.assertRaises(ValueError):
+                c.BottleClassifier(reason_path, binary_checkpoint=binary_path)
+            for key in ("backbone.features.0.0.weight", "backbone.features.0.1.running_mean",
+                        "head.weight"):
+                changed = copy.deepcopy(binary)
+                changed["state_dict"][key] += 1 if key.startswith("backbone.") else float("nan")
+                torch.save(changed, binary_path)
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    c.BottleClassifier(reason_path, binary_checkpoint=binary_path)
+            changed = copy.deepcopy(binary)
+            changed["state_dict"]["head.weight"] = torch.zeros(2, 576)
+            torch.save(changed, binary_path)
+            with self.assertRaises(RuntimeError):
+                c.BottleClassifier(reason_path, binary_checkpoint=binary_path)
+            with self.assertRaisesRegex(ValueError, "demo-dirt"):
+                c.BottleClassifier(reason_path, binary_checkpoint=binary_path, demo_dirt=True)
+
     def test_preprocessing_preserves_both_ends_and_pads_sides(self):
         image = Image.new("RGB", (20, 100), "white")
         image.paste("red", (0, 0, 20, 10))
