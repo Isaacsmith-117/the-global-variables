@@ -53,3 +53,7 @@ datasets/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local team guides
+/docs/visual-reasons.md
+/docs/visual-reasons.html

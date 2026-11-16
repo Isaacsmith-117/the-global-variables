@@ -155,7 +155,7 @@ Use reason schema **2** and project policy **`primagaz_only_v1`** for new labels
 and training. Each image needs Present, Absent or Unknown for every reason.
 Several reasons may be present together. Unknown labels are masked, never treated
 as absent. Source visual labels, project decisions and `Primagaz_status` remain
-separate facts. See [the labeling and migration guide](docs/visual-reasons.md).
+separate facts.
 
 `classifier.py` resizes each crop proportionally, pads it to 224×224 and extracts
 frozen MobileNetV3-Small features. Small linear heads score binary NOK and the
