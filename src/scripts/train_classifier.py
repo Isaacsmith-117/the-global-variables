@@ -10,12 +10,16 @@ from torch.utils.data import DataLoader, TensorDataset
 
 if __package__:
     from .classifier import (IMAGE_SIZE, REASONS, BottleClassifier, ReasonModel, bottle_scores,
-                             load_dataset, masked_loss, read_crop, targets_and_masks)
+                             load_dataset, masked_loss, primary_video_triplets, read_crop,
+                             targets_and_masks)
     from .config import DEVICE_CHOICES, RUNS_DIR, select_device
+    from .reason_schema import PROJECT_POLICY, REASON_SCHEMA_VERSION
 else:
     from classifier import (IMAGE_SIZE, REASONS, BottleClassifier, ReasonModel, bottle_scores,
-                            load_dataset, masked_loss, read_crop, targets_and_masks)
+                            load_dataset, masked_loss, primary_video_triplets, read_crop,
+                            targets_and_masks)
     from config import DEVICE_CHOICES, RUNS_DIR, select_device
+    from reason_schema import PROJECT_POLICY, REASON_SCHEMA_VERSION
 
 
 @torch.no_grad()
@@ -41,11 +45,11 @@ def confusion(truth, predicted):
             "precision": tp / (tp + fp) if tp + fp else None}
 
 
-def calibrate(bottles, enabled):
+def calibrate(bottles, enabled, reason_order=REASONS):
     """Choose per-reason validation thresholds by F2, favouring recall over precision."""
-    thresholds = dict.fromkeys(REASONS)
+    thresholds = dict.fromkeys(reason_order)
     for reason in enabled:
-        j = REASONS.index(reason)
+        j = reason_order.index(reason)
         truth = [b["truth"][j] for b in bottles]
         if 1 not in truth or 0 not in truth:
             raise ValueError(f"Validation needs positive and negative bottles for {reason}.")
@@ -62,17 +66,19 @@ def calibrate(bottles, enabled):
     return thresholds
 
 
-def evaluate_bottles(bottles, thresholds, enabled):
+def evaluate_bottles(bottles, thresholds, enabled, reason_order=REASONS):
     reasons = {}
     for reason in enabled:
-        j = REASONS.index(reason)
+        j = reason_order.index(reason)
         reasons[reason] = confusion([b["truth"][j] for b in bottles],
                                     [b["scores"][j] >= thresholds[reason] for b in bottles])
-    rejected = [any(b["scores"][REASONS.index(r)] >= thresholds[r] for r in enabled)
+    rejected = [any(b["scores"][reason_order.index(r)] >= thresholds[r] for r in enabled)
                 for b in bottles]
     return {"bottles": len(bottles), "per_reason": reasons,
-            "plant_agreement": confusion([int(b["plant_status"] == "NOK") for b in bottles], rejected),
-            "unchecked_reasons": [r for r in REASONS if r not in enabled],
+            "plant_agreement": confusion([int(b["plant_status"] == "NOK")
+                                          if b["plant_status"] in ("OK", "NOK") else None
+                                          for b in bottles], rejected),
+            "unchecked_reasons": [r for r in reason_order if r not in enabled],
             "scope": "Visual checks only; plant NOK can include unsupported/nonvisual reasons."}
 
 
@@ -81,10 +87,16 @@ def train(args):
         raise ValueError("Epochs must be positive.")
     metadata, rows = load_dataset(args.data)
     enabled = metadata["enabled_reason_outputs"]
-    train_rows = [r for r in rows if r["split"] == "train"]
-    val_rows = [r for r in rows if r["split"] == "validation"]
+    if not enabled:
+        raise ValueError("No enabled reasons; collect reviewed training and validation positives/negatives first.")
+    enabled_indices = [REASONS.index(reason) for reason in enabled]
+    train_rows = [r for r in rows if r["split"] == "train"
+                  and r.get("training_approved") is True and not r.get("quarantined")
+                  and any(r["reason_loss_mask"][j] for j in enabled_indices)]
+    val_candidates = [r for r in rows if r["split"] == "validation"]
+    val_rows = primary_video_triplets(val_candidates)
     if not train_rows or not val_rows:
-        raise ValueError("Training and validation splits must both contain bottles.")
+        raise ValueError("Need reviewed TRAIN labels and complete primary-video VALIDATION triplets.")
     targets, masks = targets_and_masks(train_rows, enabled)
     val_targets, val_masks = targets_and_masks(val_rows, enabled)
     positives = (targets * masks).sum(0)
@@ -94,7 +106,7 @@ def train(args):
         if positives[j] == 0 or negatives[j] == 0:
             raise ValueError(f"Training needs positive and negative crops for {reason}.")
     # Validate calibration coverage before downloading weights or creating output.
-    val_truth = bottle_scores(val_rows, torch.zeros(len(val_rows), 3))
+    val_truth = bottle_scores(val_rows, torch.zeros(len(val_rows), len(REASONS)))
     calibrate(val_truth, enabled)
     print("Exploratory baseline: inspect distinct positive-bottle counts before claiming accuracy.")
     print("Enabled reasons:", ", ".join(enabled))
@@ -113,8 +125,6 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         model.train()
         for x, y, mask in loader:
-            if mask.sum() == 0:
-                continue
             optimizer.zero_grad()
             loss = masked_loss(model.head(x), y, mask, weights)
             if not torch.isfinite(loss):
@@ -134,6 +144,7 @@ def train(args):
         bottles = bottle_scores(val_rows, model.head(val_features).sigmoid())
     thresholds = calibrate(bottles, enabled)
     state = {"model_state": model.state_dict(), "reason_order": list(REASONS),
+             "reason_schema_version": REASON_SCHEMA_VERSION, "project_policy": PROJECT_POLICY,
              "image_size": IMAGE_SIZE, "enabled_reasons": enabled, "thresholds": thresholds,
              "dataset_version": metadata["dataset_version"], "best_epoch": best_epoch,
              "seed": 0, "epochs": args.epochs}
@@ -141,6 +152,11 @@ def train(args):
     torch.save(state, args.output / "classifier.pt")
     report = evaluate_bottles(bottles, thresholds, enabled)
     report.update({"split": "validation", "thresholds": thresholds, "best_epoch": best_epoch,
+                   "reason_schema_version": REASON_SCHEMA_VERSION, "reason_order": list(REASONS),
+                   "project_policy": PROJECT_POLICY, "training_images": len(train_rows),
+                   "validation_images": len(val_rows),
+                   "validation_excluded_images": len(val_candidates) - len(val_rows),
+                   "evaluation_unit": "complete primary-video camera triplet",
                    "note": "Used for checkpoint/threshold selection; not independent test results."})
     (args.output / "validation.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"Saved {args.output / 'classifier.pt'}; test images were not used.")
@@ -148,17 +164,25 @@ def train(args):
 
 
 def evaluate(args):
-    _, rows = load_dataset(args.data)
-    rows = [r for r in rows if r["split"] == args.split]
-    if not rows:
-        raise ValueError(f"Empty evaluation split: {args.split}")
+    metadata, rows = load_dataset(args.data, allow_legacy=True)
     classifier = BottleClassifier(args.checkpoint, args.device)
+    if (tuple(metadata["reason_order"]) != classifier.reason_order
+            or metadata.get("project_policy") != classifier.project_policy):
+        raise ValueError("Evaluation dataset and checkpoint reason schema/project policy differ.")
+    candidates = [r for r in rows if r["split"] == args.split]
+    rows = primary_video_triplets(candidates, legacy=classifier.reason_schema_version == 1)
+    if not rows:
+        raise ValueError(f"No complete primary-video triplets in evaluation split: {args.split}")
     features = extract_features(classifier.model, args.data, rows, args.device)
     classifier.model.cpu()
     with torch.no_grad():
-        bottles = bottle_scores(rows, classifier.model.head(features).sigmoid())
-    report = evaluate_bottles(bottles, classifier.thresholds, classifier.enabled)
-    report["split"] = args.split
+        bottles = bottle_scores(rows, classifier.model.head(features).sigmoid(), classifier.reason_order)
+    report = evaluate_bottles(bottles, classifier.thresholds, classifier.enabled, classifier.reason_order)
+    report.update({"split": args.split, "reason_schema_version": classifier.reason_schema_version,
+                   "reason_order": list(classifier.reason_order),
+                   "project_policy": classifier.project_policy,
+                   "evaluation_unit": "complete primary-video camera triplet",
+                   "excluded_images": len(candidates) - len(rows)})
     print(json.dumps(report, indent=2))
     return report
 
