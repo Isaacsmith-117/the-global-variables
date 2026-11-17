@@ -7,6 +7,7 @@
 # Stage 5: compute the delay between the cameras so the videos can be played in sync.
 # Stage 6: draw the line, the boxes and the global IDs, and save output.mp4.
 # With --classifier: classify matched triplets once, then overlay OK/NOK and reasons.
+# Add --binary-classifier for an all-view verdict with separate supporting reasons.
 # With --ocr: read markings from those same crops (field boxes with --ocr-fields).
 #
 # python src/scripts/tricam_offline.py
@@ -179,6 +180,19 @@ def ocr_label(reading):
     return "OCR | " + (" | ".join(fields) or "no fields")
 
 
+def reason_labels(prediction):
+    """Show supporting findings even when they disagree with the binary verdict."""
+    lines = []
+    if prediction["reasons"]:
+        text = ", ".join(reason.replace("_", " ") for reason in prediction["reasons"])
+        lines.append("Supporting: " + text if "reason_status" in prediction else text)
+    if prediction.get("reason_unresolved"):
+        lines.append("Reason unresolved")
+    if prediction.get("reason_disagreement"):
+        lines.append("Binary/reason disagreement")
+    return lines
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Synchronized tracking over three videos.")
     parser.add_argument("--weights", type=Path,
@@ -187,6 +201,12 @@ def main(argv=None):
                         help="the 3 videos, ordered back_left back_right front")
     parser.add_argument("--output", type=Path, default=RUNS_DIR / "tricam_offline")
     parser.add_argument("--classifier", type=Path, help="Optional trained three-view classifier checkpoint.")
+    parser.add_argument("--binary-classifier", type=Path,
+                        help="Optional MobileNet binary checkpoint; requires --classifier for supporting reasons.")
+    parser.add_argument("--binary-aggregation", choices=("max", "mean"),
+                        help="Combine all three NOK scores by maximum (default) or arithmetic mean.")
+    parser.add_argument("--nok-threshold", type=float,
+                        help="NOK cutoff in [0, 1]; defaults to the binary checkpoint's saved cutoff.")
     parser.add_argument("--ocr", action="store_true", help="Read bottle markings locally.")
     parser.add_argument("--ocr-fields", type=Path, help="Optional OCR field-box detector weights.")
     parser.add_argument("--ocr-selection-config", type=Path, help="OCR selection config; defaults to ocr_selection.json.")
@@ -200,11 +220,17 @@ def main(argv=None):
                         help="track again even if saved CSVs exist (use after changing weights)")
     parser.add_argument("--no-display", action="store_true", help="only save output.mp4")
     args = parser.parse_args(argv)
+    if (args.binary_aggregation is not None or args.nok_threshold is not None) and not args.binary_classifier:
+        parser.error("--binary-aggregation and --nok-threshold require --binary-classifier.")
+    if args.nok_threshold is not None and not 0 <= args.nok_threshold <= 1:
+        parser.error("--nok-threshold must be finite and between 0 and 1.")
     device = select_device() if args.device == "auto" else args.device
     if args.start_seconds < 0 or (args.seconds is not None and args.seconds <= 0):
         raise SystemExit("Start must be nonnegative and clip duration must be positive.")
     if args.demo_dirt and not args.classifier:
         raise SystemExit("--demo-dirt requires --classifier.")
+    if args.binary_classifier and (not args.classifier or args.demo_dirt):
+        raise SystemExit("--binary-classifier requires --classifier and cannot use --demo-dirt.")
     if (args.ocr_fields or args.ocr_selection_config) and not args.ocr:
         raise SystemExit("--ocr-fields and --ocr-selection-config require --ocr.")
     try:
@@ -212,7 +238,7 @@ def main(argv=None):
     except (OSError, ValueError) as error:
         raise SystemExit(str(error)) from error
 
-    optional = [path for path in (args.classifier, args.ocr_fields) if path]
+    optional = [path for path in (args.classifier, args.binary_classifier, args.ocr_fields) if path]
     for path in [args.weights, *args.videos, *optional]:
         if not path.is_file():
             raise SystemExit(f"File missing: {path}")
@@ -288,7 +314,10 @@ def main(argv=None):
             from .classifier import BottleClassifier
         else:
             from classifier import BottleClassifier
-        predictor = BottleClassifier(args.classifier, device, demo_dirt=args.demo_dirt)
+        predictor = BottleClassifier(args.classifier, device, demo_dirt=args.demo_dirt,
+                                     binary_checkpoint=args.binary_classifier,
+                                     binary_aggregation=args.binary_aggregation or "max",
+                                     nok_threshold=args.nok_threshold)
     if args.ocr:
         if __package__:
             from .ocr import BottleOCR
@@ -351,8 +380,8 @@ def main(argv=None):
                     color = {"OK": (60, 220, 70), "NOK": (70, 70, 255),
                              "INCOMPLETE": (0, 200, 255)}.get(status, GREY)
                     lines = [f"ID {gid} | Visual: {status}"]
-                    if status == "NOK":
-                        lines.append(", ".join(reason.replace("_", " ") for reason in prediction["reasons"]))
+                    if ready:
+                        lines += reason_labels(prediction)
                 if args.ocr:
                     reading = {"fields": prediction.get("ocr_fields", {})} if ready else None
                     lines.append(ocr_label(reading) if ready else "OCR: waiting for views")
@@ -367,6 +396,8 @@ def main(argv=None):
         # info panel
         panel = np.zeros((tile_h, TILE_WIDTH, 3), np.uint8)
         lines = ["THREE-CAMERA BOTTLE INSPECTION", f"Source time: {t / fps:.1f}s"]
+        if args.binary_classifier:
+            lines.append(f"Binary: {predictor.binary_aggregation}, cutoff {predictor.binary_threshold:g}")
         if args.classifier:
             counts = inspection_counts(predictions, t, start)
             lines += [f"Visual checked: {counts['OK'] + counts['NOK']}   OK: {counts['OK']}   NOK: {counts['NOK']}",
@@ -375,7 +406,7 @@ def main(argv=None):
             if completed:
                 latest = max(completed, key=lambda p: p["ready_frame"])
                 lines.append(f"Latest bottle: {latest['bottle_id']} | {latest['status']}")
-                lines += [reason.replace("_", " ") for reason in latest["reasons"]]
+                lines += reason_labels(latest)
             unchecked = [r.replace("_", " ") for r in
                          ("major_damage", "heavy_dirt", "wrong_brand_or_model") if r not in predictor.enabled]
             lines.append("Unchecked: " + (", ".join(unchecked) if unchecked else "none"))
@@ -403,6 +434,10 @@ def main(argv=None):
         cv2.destroyAllWindows()
     if args.classifier or args.ocr:
         summary = {"checkpoint": str(args.classifier) if args.classifier else None,
+                   "binary_checkpoint": str(args.binary_classifier) if args.binary_classifier else None,
+                   "decision_source": f"binary_{predictor.binary_aggregation}" if args.binary_classifier else "reasons" if args.classifier else None,
+                   "binary_aggregation": predictor.binary_aggregation if args.binary_classifier else None,
+                   "binary_threshold": predictor.binary_threshold if args.binary_classifier else None,
                    "videos": [str(p) for p in args.videos],
                    "camera_order": VIDEO_CAMERAS, "offsets": offsets,
                    "start_frame": start, "end_frame": t + 1, "fps": fps,
