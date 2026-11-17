@@ -5,7 +5,7 @@ Emilija Rimselite, and Wood de Bock.
 
 Fine-tune YOLOv8 nano on CylinDeRS, evaluate the detector, and track cylinders
 in local video using ByteTrack. A separate WS5 classifier checks matched bottle
-crops for visible rejection reasons.
+crops for a visual OK/NOK decision and supporting rejection reasons.
 
 ## Layout
 
@@ -143,59 +143,59 @@ grouped by workbook ID in the review. Rejection-reason labels remain `unknown`
 and `review_status` remains `pending` for human annotation. Keep duplicates and
 all views of the same bottle together when preparing training splits.
 
-### Three-view classifier (WS5, issue #17)
+### Visual classifier and reason records (WS5, issues #17 and #45)
 
-The classifier takes three already-matched crops of one bottle: `front`,
-`back_left`, and `back_right`. It returns one `OK`/`NOK`, triggered reasons,
-and the camera views that supplied those reasons. `OK` means the enabled visual
-checks passed; it does not certify every plant requirement. The offline video
-integration below supplies matched crops and displays the results.
+The visual decision is binary `OK`/`NOK`. Four independent reason fields support
+the record: `corrosion`, `mechanical_damage`, `heavy_contamination`, and
+`wrong_brand_or_type`. The project accepts **PrimaGaz only**, using the agreed
+type examples; color alone does not establish brand or type. OCR supplies separate
+text evidence. A visual OK does not certify every plant requirement.
 
-`classifier.py` uses frozen pretrained MobileNetV3-Small features and one small
-trainable linear layer. Each crop is resized proportionally, padded to 224×224,
-and normalized. Training caches features once, then trains only the linear layer
-on CPU. `--device` controls feature extraction and prediction. This fixed-feature
-approach is an efficient baseline; fine-tuning can be considered after evaluation.
+Use reason schema **2** and project policy **`primagaz_only_v1`** for new labels
+and training. Each image needs Present, Absent or Unknown for every reason.
+Several reasons may be present together. Unknown labels are masked, never treated
+as absent. Source visual labels, project decisions and `Primagaz_status` remain
+separate facts.
 
-The prepared folder contains `dataset.json` and a per-crop `manifest.jsonl`.
-Targets are `0`, `1`, or `null`; masks exclude unknown and disabled labels.
-Quarantine is excluded. Plant status is an evaluation reference, never a model
-input. Every bottle's three views must belong to the same split.
+`classifier.py` resizes each crop proportionally, pads it to 224×224 and extracts
+frozen MobileNetV3-Small features. Small linear heads score binary NOK and the
+reasons. Whole-bottle inference requires matched `front`, `back_left` and
+`back_right` crops; reasons retain the views supporting them. Standalone photos
+can supply reviewed reason training examples. Validation cutoff selection uses
+complete three-camera bottle groups, matching the video decision.
+
+Export the three reason projects separately and prepare a new private dataset:
 
 ```bash
-python src/scripts/train_classifier.py train --data data/prepared/ws5_14_55_v3
-python src/scripts/classifier.py --checkpoint src/runs/classifier/baseline/classifier.pt --front data/prepared/ws5_14_55_v3/images/b001_front.jpg --back-left data/prepared/ws5_14_55_v3/images/b001_back_left.jpg --back-right data/prepared/ws5_14_55_v3/images/b001_back_right.jpg --bottle-id 14_55:1
+python src/scripts/prepare_reason_dataset.py --exports train.json validation.json final-test.json --crosswalk private-crosswalk.csv --output data/prepared/visual-reasons-v2
+python src/scripts/train_classifier.py train --data data/prepared/visual-reasons-v2 --output src/runs/classifier/reasons-v2
 ```
 
-Training defaults to 20 epochs, batch size 32, AdamW at 0.001, and seed 0.
-Positive-class weights come only from training labels. The best checkpoint is
-chosen by validation loss. For each reason, take the maximum score over the three
-views; validation bottles select a threshold in 0.05 steps to maximize F2, which
-favours recall. Thresholds are saved with the checkpoint and never selected on test
-bottles. These scores are not calibrated probabilities. The default output folder
-must not already exist; use `--output src/runs/classifier/another-run` for a new run.
-The first training invocation downloads public ImageNet weights; images stay local.
+The exporter validates project/split, image hashes and complete answer fields.
+Training consumes only approved TRAIN rows. Quarantined or unreviewed rows do not
+become negative examples. Keep every view of a physical bottle in one split.
+Validation loss, saved-weight selection and each enabled reason's cutoff use
+eligible complete video validation triplets. Training stops if an enabled reason
+lacks positive or negative support; disabled outputs remain unchecked.
+Scores are model scores, not calibrated probabilities. Test evaluation is a
+separate command, used after the model and cutoffs are fixed:
 
-The current dataset enables `major_damage` and `wrong_brand_or_model`. Heavy dirt
-is disabled because it has no positive examples. Training contains only one
-damage-positive bottle and two model-positive bottles; validation has one of each.
-Performance and threshold estimates are therefore exploratory. Inference reports
-`checked_reasons` and `unchecked_reasons`, and rejects incomplete triplets.
-NOK reasons are the supported label categories, not generated explanations.
+```bash
+python src/scripts/train_classifier.py evaluate --data data/prepared/visual-reasons-v2 --checkpoint src/runs/classifier/reasons-v2/classifier.pt
+python src/scripts/classifier.py --checkpoint src/runs/classifier/reasons-v2/classifier.pt --front path/to/front.jpg --back-left path/to/back_left.jpg --back-right path/to/back_right.jpg --bottle-id example
+```
+
 API callers pass RGB PIL images or paths to `BottleClassifier.predict()`; convert
-OpenCV BGR crops to RGB PIL images before calling it.
+OpenCV BGR crops to RGB first. Incomplete triplets are rejected. Evaluation keeps
+per-reason counts, unknown coverage and plant agreement separate. Checkpoints and
+reports stay in ignored `src/runs/`; support for schema 2 does not mean a trained
+four-reason checkpoint has been selected or validated.
 
-Evaluate only when the model and thresholds are settled:
-
-```bash
-python src/scripts/train_classifier.py evaluate --data data/prepared/ws5_14_55_v3 --checkpoint src/runs/classifier/baseline/classifier.pt
-```
-
-Evaluation reports per-reason TP/FN/FP/TN, precision/recall, unknown counts and plant
-agreement per bottle. Recall is `null` when a reason has no positive test bottles,
-as is currently the case for damage. Training opens only train/validation images;
-test evaluation is a separate command. Checkpoints and validation reports stay in
-ignored `src/runs/`; no classifier weights are selected for team use yet.
+Historical schema-1 checkpoints retain their original `major_damage`,
+`heavy_dirt` and `wrong_brand_or_model` meanings during inference. Their damage
+positives included corrosion, so renaming that output to mechanical damage would
+misstate what was learned. New training requires schema 2; preserve old labels,
+weights and reports for reproducibility.
 
 ### Annotated three-camera classifier video
 
@@ -204,12 +204,12 @@ camera display. Video order is **back-left, back-right, front**. Each bottle is
 classified once using its three line-crossing crops. All crops come from the
 videos and tracker boxes; plant labels are not used to generate predictions.
 The display shows grey Inspecting boxes, green OK boxes, red NOK boxes with
-reasons, and a panel counting completed inspections once per bottle. Heavy dirt
-remains marked unchecked. Results appear after all three crossing crops are
+reasons, and a panel counting completed inspections once per bottle. Unsupported
+reason outputs remain marked unchecked. Results appear after all three crossing crops are
 available in the synchronized playback.
 
 ```bash
-python src/scripts/tricam_offline.py --classifier src/runs/classifier/smoke-20261025/classifier.pt --tracks-dir data/dataset/tracks --start-seconds 315 --seconds 45 --output src/runs/tricam_classifier/demo --device cpu --no-display
+python src/scripts/tricam_offline.py --classifier path/to/reasons-v2.pt --tracks-dir data/dataset/tracks --start-seconds 315 --seconds 45 --output src/runs/tricam_classifier/demo --device cpu --no-display
 ```
 
 Without `--no-display`, a preview window is shown while rendering; press Q to stop.
@@ -219,12 +219,13 @@ are never overwritten. Omit `--tracks-dir` to run the detector and create tracks
 use `--videos` to provide three other recordings. Omit `--seconds` for the full
 synchronized recording. Saved tracks must correspond to the supplied videos.
 
-For a dirt-enabled integration demo, add `--demo-dirt`. With the current two-reason
-checkpoint this includes its existing untrained dirt output at a fixed 0.5 cutoff;
+For a historical schema-1 dirt integration demo, add `--demo-dirt`. With an old two-reason
+checkpoint this includes its untrained dirt output at a fixed 0.5 cutoff;
 it is not evidence of dirt-detection performance. The overlay uses the normal
 `heavy dirt` reason text. Prediction JSON records `demo_only_reasons` and the run
 records `demo_dirt_requested`. The checkpoint, dataset and normal default behaviour
-are unchanged. A future checkpoint with trained dirt keeps its saved threshold.
+are unchanged. The flag is rejected for schema 2: heavy contamination needs its
+own reviewed labels and new weights.
 
 #### Independent binary verdict and supporting reasons (issue #43)
 
@@ -264,8 +265,10 @@ rule and effective cutoff. A binary NOK without a supported reason sets
 `reason_unresolved`; different binary/reason verdicts set `reason_disagreement`.
 The overlay shows these flags and any supporting findings, including on binary OKs.
 This mode cannot use `--demo-dirt`. It is a development integration: the historical
-binary checkpoint needs refitting without reserved recording photos before final
-evaluation. OCR remains a separate source of evidence in this slice.
+binary checkpoint has no confirmed current project policy. Refit it from reviewed
+`primagaz_only_v1` visual labels without reserved recording photos before claiming
+current-policy or unseen-recording accuracy. Loading new reason weights does not
+change the binary model's learned policy. OCR remains separate evidence.
 
 This is preprocessed playback for integration, not a held-out accuracy evaluation
 or a real-time speed claim. Matching uses crossing order and camera delays; unequal

@@ -8,7 +8,7 @@
 #      (same logic as tricam_offline.py, so the numbering is the same as in output.mp4).
 # Then, for the selected bottles (all of them, or a pilot subset with --pilot N):
 #   3. saves the full frame, the crop and a debug image (line + box drawn on the frame),
-#   4. writes manifest.csv with the columns of issue #17 (+ a few extra columns at the end),
+#   4. writes manifest.csv with the current reason schema and review metadata,
 #   5. writes contacts/b001.jpg (all views of a bottle side by side) and review.html.
 #
 # Crossing-order spreadsheet matches are proposals. Only --matches, a CSV of reviewed
@@ -31,9 +31,11 @@ import pandas as pd
 
 if __package__:
     from .config import PROJECT_ROOT
+    from .reason_schema import PROJECT_POLICY, REASONS, REASON_SCHEMA_VERSION
     from .tricam_offline import LINE_FRAC, crossings, track_to_csv
 else:
     from config import PROJECT_ROOT
+    from reason_schema import PROJECT_POLICY, REASONS, REASON_SCHEMA_VERSION
     from tricam_offline import LINE_FRAC, crossings, track_to_csv
 
 # ---- default paths, all relative to the project root (same videos as tricam_offline.py).
@@ -43,11 +45,11 @@ DEFAULT_WEIGHTS = PROJECT_ROOT / "src" / "models" / "cosminCloud101Epochs.pt"
 EDGE_MARGIN = 4      # px: a box this close to the image border counts as clipped
 SYNC_TOLERANCE = 15  # frames: a bottle whose crossing delay between cameras is further off is flagged
 
-# The columns of issue #17, then extra columns that help the review.
+# Source references and four independent reasons, followed by review metadata.
 COLUMNS = [
     "image_path", "recording_id", "camera_id", "frame_index", "bottle_id", "track_id",
-    "source_row", "primagaz_status", "match_verified", "major_damage", "heavy_dirt",
-    "wrong_brand_or_model", "review_status", "notes",
+    "source_row", "primagaz_status", "match_verified", *REASONS,
+    "reason_schema_version", "project_policy", "review_status", "notes",
     "proposed_bottle_id", "spreadsheet_id", "spreadsheet_color", "clipped", "sync_dev_frames",
     "conf", "frame_path", "contact_sheet_path",
     "candidate_source_row", "candidate_spreadsheet_id", "candidate_primagaz_status",
@@ -331,6 +333,8 @@ def main(argv=None):
     matches = load_matches(args.matches, args.recording_id, cams, truth)
     run = {"complete": False, "recording_id": args.recording_id, "pad": args.pad,
            "pilot": args.pilot, "id_offset": args.id_offset,
+           "reason_schema_version": REASON_SCHEMA_VERSION, "reason_order": list(REASONS),
+           "project_policy": PROJECT_POLICY,
            "extractor": file_info(Path(__file__)),
            "truth": file_info(args.truth), "matches": file_info(args.matches) if args.matches else None,
            "cameras": []}
@@ -435,7 +439,8 @@ def main(argv=None):
                 "source_row": f"{args.truth.name}:{info['source_row']}" if info else "",
                 "primagaz_status": cell(info, "status_raw"),
                 "match_verified": int(info is not None),
-                "major_damage": "unknown", "heavy_dirt": "unknown", "wrong_brand_or_model": "unknown",
+                **dict.fromkeys(REASONS, "unknown"),
+                "reason_schema_version": REASON_SCHEMA_VERSION, "project_policy": PROJECT_POLICY,
                 "review_status": "pending", "notes": "",
                 "proposed_bottle_id": f"{args.recording_id}_b{bottle:03d}",
                 "spreadsheet_id": int(info["id"]) if info else "",

@@ -29,9 +29,11 @@ from PIL import Image
 if __package__:
     from .config import DEVICE_CHOICES, IMAGE_SIZE, PROJECT_ROOT, RUNS_DIR, select_device
     from .ocr_selection import load_selection, select_fields
+    from .reason_schema import REASON_LABELS
 else:
     from config import DEVICE_CHOICES, IMAGE_SIZE, PROJECT_ROOT, RUNS_DIR, select_device
     from ocr_selection import load_selection, select_fields
+    from reason_schema import REASON_LABELS
 
 VIDEO_CAMERAS = ("back_left", "back_right", "front")
 DEFAULT_VIDEOS = [
@@ -184,8 +186,13 @@ def reason_labels(prediction):
     """Show supporting findings even when they disagree with the binary verdict."""
     lines = []
     if prediction["reasons"]:
-        text = ", ".join(reason.replace("_", " ") for reason in prediction["reasons"])
+        text = ", ".join(REASON_LABELS.get(reason, reason.replace("_", " "))
+                         for reason in prediction["reasons"])
         lines.append("Supporting: " + text if "reason_status" in prediction else text)
+    if prediction.get("reason_schema_version") == 1:
+        lines.append("Legacy three-reason schema")
+    if prediction.get("binary_policy_unverified"):
+        lines.append("Binary policy unverified")
     if prediction.get("reason_unresolved"):
         lines.append("Reason unresolved")
     if prediction.get("reason_disagreement"):
@@ -407,16 +414,19 @@ def main(argv=None):
                 latest = max(completed, key=lambda p: p["ready_frame"])
                 lines.append(f"Latest bottle: {latest['bottle_id']} | {latest['status']}")
                 lines += reason_labels(latest)
-            unchecked = [r.replace("_", " ") for r in
-                         ("major_damage", "heavy_dirt", "wrong_brand_or_model") if r not in predictor.enabled]
+            unchecked = [REASON_LABELS.get(r, r.replace("_", " ")) for r in
+                         predictor.reason_order if r not in predictor.enabled]
+            schema_label = "1 (legacy)" if predictor.reason_schema_version == 1 else str(predictor.reason_schema_version)
+            lines.append(f"Reason schema: {schema_label}")
             lines.append("Unchecked: " + (", ".join(unchecked) if unchecked else "none"))
         else:
             lines.append(f"Bottles crossed: {len(seen)}")
         if args.ocr:
             lines.append("OCR: fields for review; decision pending")
+        lines = [part for line in lines for part in textwrap.wrap(line, width=48)]
         for n, text in enumerate(lines):
-            cv2.putText(panel, text, (20, 30 + 33 * n), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65, (235, 235, 235), 1, cv2.LINE_AA)
+            cv2.putText(panel, text, (20, 26 + 21 * n), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, (235, 235, 235), 1, cv2.LINE_AA)
 
         grid = np.vstack([np.hstack(tiles[:2]), np.hstack([tiles[2], panel])])
         writer.write(grid)
@@ -438,6 +448,12 @@ def main(argv=None):
                    "decision_source": f"binary_{predictor.binary_aggregation}" if args.binary_classifier else "reasons" if args.classifier else None,
                    "binary_aggregation": predictor.binary_aggregation if args.binary_classifier else None,
                    "binary_threshold": predictor.binary_threshold if args.binary_classifier else None,
+                   "binary_project_policy": predictor.binary_project_policy if args.binary_classifier else None,
+                   "binary_policy_unverified": predictor.binary_policy_unverified if args.binary_classifier else None,
+                   "reason_schema_version": predictor.reason_schema_version if args.classifier else None,
+                   "legacy_reason_schema": predictor.reason_schema_version == 1 if args.classifier else None,
+                   "reason_order": list(predictor.reason_order) if args.classifier else None,
+                   "project_policy": predictor.project_policy if args.classifier else None,
                    "videos": [str(p) for p in args.videos],
                    "camera_order": VIDEO_CAMERAS, "offsets": offsets,
                    "start_frame": start, "end_frame": t + 1, "fps": fps,

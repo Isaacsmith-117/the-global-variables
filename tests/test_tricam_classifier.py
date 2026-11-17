@@ -32,11 +32,26 @@ def single_tracks(frames):
 def predictor():
     model = Mock()
     model.enabled = ["major_damage", "wrong_brand_or_model"]
+    model.reason_order = ("major_damage", "heavy_dirt", "wrong_brand_or_model")
+    model.reason_schema_version = 1
+    model.project_policy = None
+    model.binary_project_policy = None
+    model.binary_policy_unverified = False
     model.predict.return_value = {"bottle_id": 1, "status": "NOK", "reasons": ["major_damage"]}
     return model
 
 
 class TricamClassifierTests(unittest.TestCase):
+    def test_reason_labels_use_v2_names_and_mark_legacy_records(self):
+        result = {"reasons": ["corrosion", "mechanical_damage", "heavy_contamination", "wrong_brand_or_type"],
+                  "reason_status": "NOK", "reason_schema_version": 2}
+        self.assertEqual(tricam.reason_labels(result), [
+            "Supporting: Significant corrosion, Major mechanical damage, Heavy contamination, Wrong brand or bottle type"])
+        legacy = {"reasons": ["major_damage"], "reason_schema_version": 1}
+        self.assertEqual(tricam.reason_labels(legacy), ["major damage", "Legacy three-reason schema"])
+        self.assertEqual(tricam.reason_labels({**result, "binary_policy_unverified": True})[-1],
+                         "Binary policy unverified")
+
     def test_binary_options_require_reason_checkpoint_without_demo_dirt(self):
         for args in [["--binary-classifier", "binary.pt"],
                      ["--classifier", "reason.pt", "--binary-classifier", "binary.pt", "--demo-dirt"]]:
@@ -124,6 +139,10 @@ class TricamClassifierTests(unittest.TestCase):
             model.predict.assert_called_once()
             summary = json.loads(output.with_name("predictions.json").read_text())
             self.assertEqual(summary["counts"], {"OK": 0, "NOK": 1, "INCOMPLETE": 0})
+            self.assertEqual(summary["reason_schema_version"], 1)
+            self.assertTrue(summary["legacy_reason_schema"])
+            self.assertEqual(summary["reason_order"], list(model.reason_order))
+            self.assertIsNone(summary["project_policy"])
             capture = cv2.VideoCapture(str(output))
             self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 48)
             capture.set(cv2.CAP_PROP_POS_FRAMES, 35)
@@ -138,17 +157,35 @@ class TricamClassifierTests(unittest.TestCase):
 
             binary = root / "binary.pt"
             binary.touch()
+            original_put_text = cv2.putText
+            panel_texts = []
+
+            def checked_put_text(image, text, origin, font, scale, color, thickness, *args, **kwargs):
+                if color == (235, 235, 235):
+                    (width, height), descent = cv2.getTextSize(text, font, scale, thickness)
+                    self.assertEqual(image.shape[:2], (360, 640))
+                    self.assertGreaterEqual(origin[0], 0)
+                    self.assertGreaterEqual(origin[1] - height, 0)
+                    self.assertLessEqual(origin[0] + width, image.shape[1] - 1)
+                    self.assertLessEqual(origin[1] + descent, image.shape[0] - 1)
+                    if text not in panel_texts:
+                        panel_texts.append(text)
+                return original_put_text(image, text, origin, font, scale, color, thickness, *args, **kwargs)
+
             for aggregation, status, reasons in [("max", "NOK", []), ("mean", "OK", ["major_damage"])]:
                 hybrid = predictor()
                 hybrid.binary_aggregation = aggregation
                 hybrid.binary_threshold = 0.7
+                hybrid.binary_policy_unverified = True
                 hybrid.predict.return_value.update(
                     status=status, reasons=reasons, reason_status="OK" if status == "NOK" else "NOK",
                     decision_source=f"binary_{aggregation}", binary_scores={"front": 0.1, "back_left": 0.9, "back_right": 0.1},
                     binary_score=0.9 if aggregation == "max" else 1.1 / 3,
                     binary_aggregation=aggregation, binary_threshold=0.7,
+                    reason_schema_version=1, binary_policy_unverified=True,
                     reason_unresolved=status == "NOK", reason_disagreement=True)
-                with patch("src.scripts.classifier.BottleClassifier", return_value=hybrid) as constructor:
+                with (patch("src.scripts.classifier.BottleClassifier", return_value=hybrid) as constructor,
+                      patch.object(tricam.cv2, "putText", new=checked_put_text)):
                     output = tricam.main(["--weights", str(weights), "--videos", *map(str, videos),
                                           "--classifier", str(checkpoint), "--binary-classifier", str(binary),
                                           "--binary-aggregation", aggregation, "--nok-threshold", "0.7",
@@ -170,6 +207,9 @@ class TricamClassifierTests(unittest.TestCase):
                 labels = tricam.reason_labels(result)
                 self.assertIn("Binary/reason disagreement", labels)
                 self.assertIn("Reason unresolved" if status == "NOK" else "Supporting: major damage", labels)
+            for text in ("Legacy three-reason schema", "Binary policy unverified", "Reason unresolved",
+                         "Binary/reason disagreement", "Unchecked: heavy dirt"):
+                self.assertIn(text, panel_texts)
 
             ocr = Mock()
             ocr.selection = tricam.load_selection()
@@ -203,6 +243,34 @@ class TricamClassifierTests(unittest.TestCase):
             self.assertEqual(date["best"]["frame"], result["crops"]["front"]["frame"])
             self.assertEqual(date["best"]["box"], [0, 0, 5, 5])
             self.assertEqual(result["crops"]["front"]["track_id"], 3)
+            capture = cv2.VideoCapture(str(output))
+            self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 48)
+            capture.release()
+
+            four = predictor()
+            four.reason_order = ("corrosion", "mechanical_damage", "heavy_contamination", "wrong_brand_or_type")
+            four.enabled = list(four.reason_order)
+            four.reason_schema_version = 2
+            four.project_policy = "primagaz_only_v1"
+            four.binary_aggregation, four.binary_threshold = "mean", 0.7
+            four.binary_policy_unverified = True
+            four.predict.return_value.update(
+                status="OK", reasons=list(four.reason_order), reason_status="NOK",
+                reason_schema_version=2, binary_policy_unverified=True, reason_disagreement=True)
+            extra_ocr = Mock()
+            extra_ocr.selection = tricam.load_selection()
+            extra_ocr.read.return_value = {"readings": [], "fields": {}, "candidates": []}
+            panel_texts.clear()
+            with (patch("src.scripts.classifier.BottleClassifier", return_value=four),
+                  patch("src.scripts.ocr.BottleOCR", return_value=extra_ocr),
+                  patch.object(tricam.cv2, "putText", new=checked_put_text)):
+                output = tricam.main(["--weights", str(weights), "--videos", *map(str, videos),
+                                      "--classifier", str(checkpoint), "--binary-classifier", str(binary),
+                                      "--binary-aggregation", "mean", "--ocr", "--tracks-dir", str(root),
+                                      "--output", str(root / "four-reasons"), "--device", "cpu", "--no-display"])
+            for text in ("Significant corrosion", "Major mechanical damage", "Heavy contamination",
+                         "Wrong brand or bottle type", "OCR: fields for review; decision pending"):
+                self.assertIn(text, " ".join(panel_texts))
             capture = cv2.VideoCapture(str(output))
             self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 48)
             capture.release()
