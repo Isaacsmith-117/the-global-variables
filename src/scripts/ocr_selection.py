@@ -13,6 +13,8 @@ TARE_LABELS = {"t", "tw", "tara", "tarra", "tare"}
 WEIGHT_LABEL = re.compile(r"\b(?:tw|tara|tarra|tare|netto|net|butaan|propaan|butane|propane)\b", re.I)
 LIMITS = {"min_field_confidence", "min_ocr_confidence", "min_margin"}
 MIN_DATE_YEAR = 2000  # older stamped dates, e.g. manufacture years, are not candidates (#37)
+MAX_DATE_YEAR = 2040  # recordings are from 2025 and an approval lasts at most 15 years
+TARE_RANGE_KG = (5.0, 25.0)  # plausible tare of these cylinders; other values are misreads
 
 
 def parse_candidates(field, text):
@@ -40,6 +42,8 @@ def parse_candidates(field, text):
             if not label and re.match(r"\s*(?:kg\s+)?net(?:to)?\b", after, re.I):
                 continue
             value = float(raw.replace(",", ".")) or None
+            if value is not None and not TARE_RANGE_KG[0] <= value <= TARE_RANGE_KG[1]:
+                continue
         elif field.endswith("_date"):
             if before[-1:].isalnum() or after[:1].isalnum() or re.search(r"\bun\s*$", before, re.I):
                 continue  # e.g. UN1965 and serial numbers
@@ -60,7 +64,7 @@ def parse_candidates(field, text):
                     value = date.fromisoformat(raw).isoformat()
             except ValueError:
                 pass
-            if value is not None and int(value[:4]) < MIN_DATE_YEAR:
+            if value is not None and not MIN_DATE_YEAR <= int(value[:4]) <= MAX_DATE_YEAR:
                 value = None  # the raw text stays in the readings for review
         if value is not None:
             candidates.append({"value": value, "start": match.start(), "end": match.end(),
