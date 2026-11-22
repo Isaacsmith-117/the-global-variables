@@ -103,8 +103,9 @@ def select_fields(views, config, provenance=None):
     Scores are ranking heuristics, not probabilities. Repeated reads by one engine get no
     vote bonus. A value read by both EasyOCR and PARSeq is agreed: it skips the OCR
     confidence minimum, because EasyOCR can be confidently wrong, and ranks before values
-    that are not agreed. Provenance is supplied by the caller that has already matched the
-    bottle views.
+    that are not agreed. Only reads in boxes that pass the field minimum can agree, so a
+    weak detection never corroborates a value. Provenance is supplied by the caller that
+    has already matched the bottle views.
     """
     selected = {}
     for field, limits in config["fields"].items():
@@ -129,7 +130,9 @@ def select_fields(views, config, provenance=None):
                 groups.setdefault(candidate["value"], []).append(observation)
         alternatives = []
         for value, observations in groups.items():
-            agreed = len({c.get("engine", "easyocr") for c in observations}) > 1
+            strong = [c for c in observations if not configured or (
+                c["field_confidence"] is not None and c["field_confidence"] >= limits["min_field_confidence"])]
+            agreed = len({c.get("engine", "easyocr") for c in strong}) > 1
             for c in observations:
                 c["qualified"] = (configured and c["score"] is not None
                                   and c["field_confidence"] >= limits["min_field_confidence"]

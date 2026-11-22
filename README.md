@@ -309,7 +309,8 @@ observation using `field_confidence**alpha * ocr_confidence**(1-alpha)`. Repeate
 readings record support for a value. The score remains the best observation's
 score. A value read by both EasyOCR and PARSeq, in any view of the bottle, is
 `agreed`. It skips the OCR-confidence minimum but not the field minimum, and it
-ranks before values that are not agreed. On development boxes EasyOCR was often
+ranks before values that are not agreed. Only reads in boxes that pass the field
+minimum can agree, so a weak detection never corroborates a value (#51). On development boxes EasyOCR was often
 confidently wrong, while agreeing reads were always correct. The margin compares
 the two highest distinct qualifying values of the same kind (agreed or not).
 
@@ -379,6 +380,26 @@ whether the parser extracts the transcribed value. Run it from the OCR environme
 
 ```bash
 src/runs/ocr/runtime/bin/python src/scripts/evaluate_recognition.py data/ocr_v2 --output src/runs/ocr-fields/recognition
+```
+
+Targeted second reads (#51) are tested before they enter the pipeline.
+`second_reads()` in `ocr.py` works on one bottle's reader results and keeps the
+original observations. A withheld tare gets a PARSeq reread, with zero extra
+border, of every tare box that passes the field minimum, and the selection runs
+again. An accepted year supported by one view and one reader is reread the same
+way and kept only if the reread contains it; otherwise it becomes `unconfirmed`.
+The reread is not counted as another source. `compare_second_reads.py` replays
+the bottle caches written by the team's `run_ocr.py`, with their images and a
+frozen config, rerunning only PARSeq. It scores the original and each reread
+variant separately against the human markings (`marking_*`) and workbook
+references (`workbook_*`) of a team references CSV (tare within 0.10 kg, year
+exact). It reports correct, wrong, partial (tare without its fraction) and blank,
+plus correct reads lost, wrong reads removed and extra seconds per bottle. Each
+variant's predictions are also written for `score_full_ocr.py`. Use development
+passages that were not used for earlier tuning or testing.
+
+```bash
+src/runs/ocr/runtime/bin/python src/scripts/compare_second_reads.py <run>/cache --config <frozen selection.json> --references <references.csv> --output src/runs/ocr-fields/51-second-reads
 ```
 
 To use OCR in the three-camera pipeline, run it from the OCR environment and
