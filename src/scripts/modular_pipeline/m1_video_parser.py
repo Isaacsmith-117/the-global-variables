@@ -36,15 +36,25 @@ def select_device():
     return "cpu"
 
 
-def track_to_csv(weights, video, csv_path, device=None):
-    """Run YOLO + ByteTrack and save every detected track box."""
+def track_to_csv(weights, video, csv_path, device=None, max_seconds=None):
+    """Run YOLO + ByteTrack and save detected track boxes for the requested prefix."""
     weights, video, csv_path = Path(weights), Path(video), Path(csv_path)
+    max_frames = None
+    if max_seconds is not None:
+        capture = cv2.VideoCapture(str(video))
+        fps = capture.get(cv2.CAP_PROP_FPS)
+        capture.release()
+        if fps > 0:
+            max_frames = max(0, round(float(max_seconds) * fps))
+
     results = YOLO(str(weights)).track(
         source=str(video), tracker=TRACKER, conf=TRACK_CONFIDENCE, imgsz=IMAGE_SIZE,
         device=device or select_device(), stream=True, verbose=False,
     )
     rows = []
     for frame, result in enumerate(results):
+        if max_frames is not None and frame >= max_frames:
+            break
         if frame % 500 == 0:
             print(f"  frame {frame}", flush=True)
         if result.boxes.id is None:
@@ -102,6 +112,107 @@ def ocr_label(reading):
     return "OCR | " + (" | ".join(fields) or "no fields")
 
 
+def bottle_table_row(prediction):
+    """Build compact inspection values for the on-video bottle table."""
+    final_status = prediction.get("final_status", prediction.get("status", "INCOMPLETE"))
+    visual_status = prediction.get("status", "INCOMPLETE")
+
+    tare_field = prediction.get("ocr_fields", {}).get("tare_kg", {})
+    tare_value = tare_field.get("value") if tare_field.get("status") == "accepted" else None
+    tare_status = tare_field.get("status", "not_checked")
+    tare = f"{tare_value:g}" if isinstance(tare_value, (int, float)) else "-"
+
+    approval_field = prediction.get("ocr_fields", {}).get("approval_until_date", {})
+    approval_status = approval_field.get("status", "not_checked")
+    approval_value = approval_field.get("value")
+    try:
+        year = str(int(str(approval_value)[:4])) if approval_status == "accepted" else "-"
+    except (TypeError, ValueError):
+        year = "-"
+
+    if tare_status == "accepted" and approval_status == "accepted":
+        ocr_status = "accepted"
+    elif tare_status == "missing" or approval_status == "missing":
+        ocr_status = "missing"
+    elif tare_status == "not_checked" and approval_status == "not_checked":
+        ocr_status = "not_checked"
+    else:
+        ocr_status = "review"
+
+    reasons = ";".join(prediction.get("reasons", [])[:2])
+    visual = visual_status if not reasons else f"{visual_status}:{reasons}"
+    short_status = {
+        "NOT_CHECKED": "UNCHECKED",
+        "INCOMPLETE": "INCOMPLETE",
+    }.get(final_status, final_status)
+    visual_status = {
+        "NOT_CHECKED": "UNCHECKED",
+    }.get(visual_status, visual_status)
+    if reasons:
+        visual = f"{visual_status}:{';'.join(reasons[:2])}"
+    else:
+        visual = visual_status
+
+    return short_status, visual, tare, year, ocr_status
+
+
+def draw_bottle_table(panel, predictions, synchronized_frame, start, table_top=None):
+    """Draw newest-first completed bottle results, highlighting the most recent row."""
+    completed = [prediction for prediction in predictions.values()
+                 if start <= prediction.get("ready_frame", synchronized_frame + 1) <= synchronized_frame]
+    completed.sort(key=lambda prediction: prediction.get("ready_frame", 0), reverse=True)
+
+    if table_top is None:
+        table_top = 190
+    if not completed:
+        cv2.putText(panel, "BOTTLES: waiting for crossings", (20, table_top),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (160, 160, 160), 1, cv2.LINE_AA)
+        return
+
+    cv2.putText(panel, "BOTTLE INSPECTIONS (newest first)", (20, table_top),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+    header_y = table_top + 25
+    columns = ((20, "ID"), (55, "FINAL"), (175, "VISUAL"),
+               (350, "TARE"), (420, "YEAR"), (495, "OCR"))
+    for x, label in columns:
+        cv2.putText(panel, label, (x, header_y), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (180, 180, 180), 1, cv2.LINE_AA)
+
+    row_height = 25
+    first_row_y = header_y + 18
+    max_rows = max(0, (panel.shape[0] - first_row_y) // row_height)
+    latest_ready = completed[0].get("ready_frame") if completed else None
+
+    for index, prediction in enumerate(completed[:max_rows]):
+        y = first_row_y + index * row_height
+        final_status, visual, tare, year, ocr_status = bottle_table_row(prediction)
+        latest = prediction.get("ready_frame") == latest_ready
+
+        if latest:
+            cv2.rectangle(panel, (10, y - 17), (panel.shape[1] - 10, y + 5),
+                          (45, 45, 20), -1)
+            cv2.rectangle(panel, (10, y - 17), (16, y + 5),
+                          (0, 220, 255), -1)
+
+        status_color = {"OK": (60, 220, 70), "NOK": (70, 70, 255),
+                        "INCOMPLETE": (0, 200, 255)}.get(final_status, (180, 180, 180))
+        cv2.putText(panel, str(prediction.get("bottle_id", "-")), (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(panel, str(final_status), (55, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, status_color, 1, cv2.LINE_AA)
+
+        visual_text = textwrap.shorten(str(visual), width=20, placeholder="...")
+        cv2.putText(panel, visual_text, (175, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"{tare} kg" if tare != "-" else "-", (350, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(panel, year, (420, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+        cv2.putText(panel, ocr_status, (495, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+
+
 def reason_labels(prediction):
     lines = []
     if prediction["reasons"]:
@@ -122,7 +233,8 @@ def reason_labels(prediction):
 class VideoParser:
     """Detect, synchronize and render three conveyor recordings."""
 
-    def prepare(self, weights, videos, output, tracks_dir=None, retrack=False, device="cpu"):
+    def prepare(self, weights, videos, output, tracks_dir=None, retrack=False,
+                device="cpu", max_seconds=None):
         weights, videos = Path(weights), [Path(video) for video in videos]
         output = Path(output)
         for weight, video in [(weights, None), *[(None, video) for video in videos]]:
@@ -141,16 +253,20 @@ class VideoParser:
             raise SystemExit("The three recordings must have matching, positive frame rates.")
 
         tracks = []
+        duration_suffix = ""
+        if max_seconds is not None:
+            duration_suffix = f"_first_{max_seconds:g}s"
         for video in videos:
-            csv_path = (tracks_dir or output) / f"{video.stem}.csv"
+            csv_path = (tracks_dir or output) / f"{video.stem}{duration_suffix}.csv"
             if tracks_dir and (not csv_path.is_file() or retrack):
-                raise SystemExit("--tracks-dir requires existing CSVs and cannot be used with --retrack.")
+                raise SystemExit("--tracks-dir requires existing prefix-track CSVs and cannot be used with --retrack.")
             if csv_path.is_file() and not retrack:
                 print(f"Using saved tracks {csv_path} (use --retrack to track again)")
                 tracks.append(pd.read_csv(csv_path))
             else:
-                print(f"Tracking {video.name} ...")
-                tracks.append(track_to_csv(weights, video, csv_path, device))
+                limit = f" for the first {max_seconds:g} seconds" if max_seconds is not None else ""
+                print(f"Tracking {video.name}{limit} ...")
+                tracks.append(track_to_csv(weights, video, csv_path, device, max_seconds))
 
         events = [crossings(frame_tracks, width) for frame_tracks, width in zip(tracks, widths)]
         if any(not camera_events for camera_events in events):
@@ -263,10 +379,6 @@ class VideoParser:
                                 f"OK: {sum(p['status'] == 'OK' for p in completed)}   "
                                 f"NOK: {sum(p['status'] == 'NOK' for p in completed)}",
                                 f"Incomplete: {sum(p['status'] == 'INCOMPLETE' for p in completed)}"]
-                if completed:
-                    latest = max(completed, key=lambda prediction: prediction["ready_frame"])
-                    panel_lines.append(f"Latest bottle: {latest['bottle_id']} | {latest['status']}")
-                    panel_lines += reason_labels(latest)
                 if predictor is not None:
                     unchecked = [REASON_LABELS.get(reason, reason.replace("_", " "))
                                  for reason in predictor.reason_order if reason not in predictor.enabled]
@@ -275,21 +387,45 @@ class VideoParser:
                     panel_lines.append("Unchecked: " + (", ".join(unchecked) if unchecked else "none"))
             else:
                 panel_lines.append(f"Bottles crossed: {len(seen)}")
-            if args.ocr:
-                panel_lines.append("OCR: fields for review; decision pending")
             panel_lines = [part for line in panel_lines for part in textwrap.wrap(line, width=48)]
             for index, text in enumerate(panel_lines):
                 cv2.putText(panel, text, (20, 26 + 21 * index), cv2.FONT_HERSHEY_SIMPLEX,
                             0.55, (235, 235, 235), 1, cv2.LINE_AA)
+
+            table_predictions = dict(predictions)
+            for bottle_id in seen:
+                if bottle_id in table_predictions:
+                    continue
+                ready_frames = []
+                for camera_index, mapping in enumerate(global_ids):
+                    for track_id, mapped_id in mapping.items():
+                        if mapped_id == bottle_id:
+                            ready_frames.append(crossed_at[camera_index][track_id] - offsets[camera_index])
+                if ready_frames:
+                    table_predictions[bottle_id] = {
+                        "bottle_id": bottle_id,
+                        "ready_frame": max(ready_frames),
+                        "status": "NOT_CHECKED",
+                        "final_status": "NOT_CHECKED",
+                        "ocr_fields": {},
+                        "reasons": [],
+                    }
+
+            table_top = 26 + 21 * len(panel_lines) + 38
+            draw_bottle_table(panel, table_predictions, synchronized_frame, start, table_top)
 
             grid = np.vstack([np.hstack(tiles[:2]), np.hstack([tiles[2], panel])])
             writer.write(grid)
             if (synchronized_frame - start + 1) % 230 == 0:
                 print(f"Rendered {synchronized_frame - start + 1}/{end - start} frames", flush=True)
             if not args.no_display:
-                cv2.imshow("Tricam", grid)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                try:
+                    cv2.imshow("Tricam", grid)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except cv2.error:
+                    print("Display unavailable (OpenCV GUI support is missing); continuing without a window.", flush=True)
+                    args.no_display = True
 
         writer.release()
         for capture in captures:

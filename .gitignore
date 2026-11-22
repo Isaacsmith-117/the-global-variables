@@ -25,6 +25,7 @@ data/
 datasets/
 
 # Keep raw videos local even if copied outside data/
+videos/
 *.webm
 *.mp4
 *.mov

@@ -245,7 +245,8 @@ def main(argv=None):
 
     parser_stage = VideoParser()
     prepared = parser_stage.prepare(args.weights, args.videos, args.output,
-                                    args.tracks_dir, args.retrack, device)
+                                    args.tracks_dir, args.retrack, device,
+                                    max_seconds=args.seconds)
     predictor = None
     ocr = None
 
