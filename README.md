@@ -294,7 +294,10 @@ Use the field classes `tare_kg` and `approval_until_date`. The parser normalizes
 `2025`, `03/2025`, `2025/03`, `03/25`, and ISO dates such as `2025-03-01`. For
 two-digit years, 50–99 map to 1950–1999 and 00–49 map to 2000–2049. Dates before
 2000, such as old manufacture stamps, are not candidates (#37); a field with only
-such dates is missing. Malformed numbers and ambiguous day/month/year formats stay
+such dates is missing. Plausibility ranges, agreed with the team, also reject tare
+values outside 5–25 kg and dates after 2040 (the 2025 recordings plus the longest
+15-year approval), so absurd misreads cannot win. These parser rules never change
+a human transcription. Malformed numbers and ambiguous day/month/year formats stay
 in the raw text. Explicit net weight and litre markings are excluded from tare
 candidates.
 

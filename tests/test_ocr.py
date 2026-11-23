@@ -82,6 +82,9 @@ class OCRTests(unittest.TestCase):
                  ("test_date", "UN 1965 2034", "2034"),
                  ("test_date", "2034 2035", None), ("test_date", "2032-02-29", "2032-02-29"),
                  ("test_date", "2033-02-29", None), ("test_date", "2034-003-001", None)]
+        cases += [("tare_kg", "TARE 70.2 KG", None), ("tare_kg", "4.9", None), ("tare_kg", "5", 5.0),
+                  ("tare_kg", "25", 25.0), ("tare_kg", "25.1 kg", None),
+                  ("test_date", "2040", "2040"), ("test_date", "01/41", None), ("test_date", "2041", None)]
         for field, text, value in cases:
             with self.subTest(field=field, text=text):
                 self.assertEqual(ocr.parse_value(field, text), value)
