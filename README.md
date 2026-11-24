@@ -388,6 +388,8 @@ original observations. A withheld tare gets a PARSeq reread, with zero extra
 border, of every tare box that passes the field minimum, and the selection runs
 again. An accepted year supported by one view and one reader is reread the same
 way and kept only if the reread contains it; otherwise it becomes `unconfirmed`.
+Any read with the same year counts as support, so `2034` and `05/2034` from two
+views agree. A tare retry is logged only when the reader runs on a box.
 The reread is not counted as another source. `compare_second_reads.py` replays
 the bottle caches written by the team's `run_ocr.py`, with their images and a
 frozen config, rerunning only PARSeq. It scores the original and each reread

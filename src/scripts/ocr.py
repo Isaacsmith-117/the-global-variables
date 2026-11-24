@@ -138,7 +138,8 @@ def second_reads(predictor, images, views, selection, tare=True, year=True):
     Tare: if the bottle tare is withheld, every tare box that passes the field minimum is
     reread and the selection runs again with those reads added. Year: if an accepted year
     has one view and one reader as support, its box is reread and the year is kept only if
-    the reread contains it. The reread sees the same pixels, so it is not another source.
+    the reread contains it. Any value with that year supports it (2034 and 05/2034 agree).
+    The reread sees the same pixels, so it is not another source.
     """
     if any(value is None for limits in selection["fields"].values() for value in limits.values()):
         raise ValueError("Second reads need a selection config with all thresholds set.")
@@ -146,11 +147,11 @@ def second_reads(predictor, images, views, selection, tare=True, year=True):
     fields = select_fields(views, selection)
     tare_minimum = selection["fields"]["tare_kg"]["min_field_confidence"]
     if tare and fields["tare_kg"]["status"] != "accepted":
-        record["tare_reread"] = True
         for name, view in views.items():
             for proposal in view["proposals"]:
                 if proposal["field"] != "tare_kg" or proposal["field_confidence"] < tare_minimum:
                     continue
+                record["tare_reread"] = True  # logged only when the reader runs on a box
                 (x1, y1, x2, y2), (text, score) = proposal["box"], reread(predictor, images[name], proposal["box"])
                 view["readings"].append({"text": text, "confidence": score, "source": "tare_reread",
                                          "engine": "parseq", "box": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]})
@@ -160,8 +161,8 @@ def second_reads(predictor, images, views, selection, tare=True, year=True):
     approval = fields["approval_until_date"]
     year_minimum = selection["fields"]["approval_until_date"]["min_field_confidence"]
     if year and approval["status"] == "accepted":
-        support = [c for c in approval["alternatives"][0]["observations"]
-                   if (c["field_confidence"] or 0) >= year_minimum]
+        support = [c for alternative in approval["alternatives"] if alternative["value"][:4] == approval["value"][:4]
+                   for c in alternative["observations"] if (c["field_confidence"] or 0) >= year_minimum]
         if len({c["view"] for c in support}) == 1 and len({c.get("engine", "easyocr") for c in support}) == 1:
             best = support[0]
             text, _ = reread(predictor, images[best["view"]], best["box"])

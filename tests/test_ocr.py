@@ -207,6 +207,32 @@ class OCRTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ocr.second_reads(predictor, image, views, load_selection())
 
+    def test_year_and_month_year_from_two_views_agree_on_the_year(self):
+        config = configured_selection()
+        year = {"field": "approval_until_date", "value": "2034", "field_confidence": 0.9,
+                "ocr_confidence": 0.9, "box": [10, 10, 40, 30], "source": "field_region"}
+        views = {"front": {"readings": [], "candidates": [year], "proposals": []},
+                 "back_left": {"readings": [], "proposals": [],
+                               "candidates": [{**year, "value": "2034-05", "ocr_confidence": 0.6}]}}
+        failed = Mock(return_value=[("2031", 0.9)])  # a reread that would not contain 2034
+        fields, record = ocr.second_reads(failed, {name: np.zeros((40, 60, 3), np.uint8) for name in views},
+                                          views, config, tare=False)
+        self.assertEqual((fields["approval_until_date"]["value"], fields["approval_until_date"]["status"]),
+                         ("2034", "accepted"))
+        failed.assert_not_called()  # two views support the year, so no reread is needed
+        self.assertIsNone(record["year_reread"])
+
+    def test_tare_retry_is_logged_only_when_a_box_is_reread(self):
+        config = configured_selection()
+        views = {"front": {"readings": [], "candidates": [candidate(10.7, 0.9, 0.3)], "proposals": [
+            {"field": "tare_kg", "box": [0, 0, 8, 8], "field_confidence": 0.2}]}}  # only a weak box
+        predictor = Mock()
+        fields, record = ocr.second_reads(predictor, {"front": np.zeros((40, 60, 3), np.uint8)}, views, config,
+                                          year=False)
+        predictor.assert_not_called()
+        self.assertFalse(record["tare_reread"])
+        self.assertIsNone(fields["tare_kg"]["value"])
+
     def test_parseq_reads_each_field_box_as_a_second_engine(self):
         model = field_model([("tare_kg", 0.9, [10, 10, 40, 30])])
         reader = bottle_ocr("TARE 10.7 KG", model, configured_selection(), second=("TARE 10.7KG", 0.4))
