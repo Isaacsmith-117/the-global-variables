@@ -161,6 +161,78 @@ class OCRTests(unittest.TestCase):
         result = select_fields({"front": {"candidates": [candidate(10.7, 0.4, 0.9), weak_box]}}, config)["tare_kg"]
         self.assertEqual(result["status"], "low_confidence")  # agreement does not skip the field minimum
 
+    def test_weak_detection_cannot_corroborate_a_wrong_value(self):
+        # Regression (#51): a box below the field minimum must not make a wrong value agreed.
+        config = configured_selection()
+        wrong = candidate(18.7, 0.9, 0.3)  # strong box, OCR confidence below the minimum
+        weak = {**candidate(18.7, 0.2, 0.9), "engine": "parseq"}
+        result = select_fields({"front": {"candidates": [wrong, weak]}}, config)["tare_kg"]
+        self.assertFalse(result["alternatives"][0]["agreed"])
+        self.assertEqual((result["value"], result["status"]), (None, "low_confidence"))
+
+    def test_withheld_tare_is_reread_without_border(self):
+        config = configured_selection()
+        strong, weak = [10, 10, 40, 30], [0, 0, 8, 8]
+        views = {"front": {"readings": [], "candidates": [candidate(10.7, 0.9, 0.3)], "proposals": [
+            {"field": "tare_kg", "box": strong, "field_confidence": 0.9},
+            {"field": "tare_kg", "box": weak, "field_confidence": 0.2}]}}
+        original = json.dumps(views)
+        predictor = Mock(side_effect=lambda crops: [("TARE 10.7KG", 0.6)])
+        fields, record = ocr.second_reads(predictor, {"front": np.zeros((40, 60, 3), np.uint8)}, views, config,
+                                          year=False)
+        self.assertEqual(predictor.call_count, 1)  # the weak box is not reread
+        self.assertEqual(predictor.call_args.args[0][0].shape, (20, 30, 3))  # zero extra border
+        self.assertTrue(record["tare_reread"])
+        self.assertEqual((fields["tare_kg"]["value"], fields["tare_kg"]["status"]), (10.7, "accepted"))
+        self.assertEqual(json.dumps(views), original)  # original observations are unchanged
+
+    def test_single_source_year_is_kept_only_if_the_reread_contains_it(self):
+        config = configured_selection()
+        year = {"field": "approval_until_date", "value": "2034", "field_confidence": 0.9,
+                "ocr_confidence": 0.9, "box": [10, 10, 40, 30], "source": "field_region"}
+        image = {"front": np.zeros((40, 60, 3), np.uint8)}
+        for text, value, status in [("2034", "2034", "accepted"), ("2031", None, "unconfirmed")]:
+            with self.subTest(reread=text):
+                views = {"front": {"readings": [], "candidates": [year], "proposals": []}}
+                fields, record = ocr.second_reads(Mock(return_value=[(text, 0.8)]), image, views, config, tare=False)
+                self.assertEqual((fields["approval_until_date"]["value"], fields["approval_until_date"]["status"]),
+                                 (value, status))
+                self.assertEqual(record["year_reread"]["kept"], value is not None)
+        # Two readers already support the year: no reread.
+        views = {"front": {"readings": [], "candidates": [year, {**year, "engine": "parseq"}], "proposals": []}}
+        predictor = Mock()
+        fields, record = ocr.second_reads(predictor, image, views, config, tare=False)
+        predictor.assert_not_called()
+        self.assertEqual(fields["approval_until_date"]["value"], "2034")
+        with self.assertRaises(ValueError):
+            ocr.second_reads(predictor, image, views, load_selection())
+
+    def test_year_and_month_year_from_two_views_agree_on_the_year(self):
+        config = configured_selection()
+        year = {"field": "approval_until_date", "value": "2034", "field_confidence": 0.9,
+                "ocr_confidence": 0.9, "box": [10, 10, 40, 30], "source": "field_region"}
+        views = {"front": {"readings": [], "candidates": [year], "proposals": []},
+                 "back_left": {"readings": [], "proposals": [],
+                               "candidates": [{**year, "value": "2034-05", "ocr_confidence": 0.6}]}}
+        failed = Mock(return_value=[("2031", 0.9)])  # a reread that would not contain 2034
+        fields, record = ocr.second_reads(failed, {name: np.zeros((40, 60, 3), np.uint8) for name in views},
+                                          views, config, tare=False)
+        self.assertEqual((fields["approval_until_date"]["value"], fields["approval_until_date"]["status"]),
+                         ("2034", "accepted"))
+        failed.assert_not_called()  # two views support the year, so no reread is needed
+        self.assertIsNone(record["year_reread"])
+
+    def test_tare_retry_is_logged_only_when_a_box_is_reread(self):
+        config = configured_selection()
+        views = {"front": {"readings": [], "candidates": [candidate(10.7, 0.9, 0.3)], "proposals": [
+            {"field": "tare_kg", "box": [0, 0, 8, 8], "field_confidence": 0.2}]}}  # only a weak box
+        predictor = Mock()
+        fields, record = ocr.second_reads(predictor, {"front": np.zeros((40, 60, 3), np.uint8)}, views, config,
+                                          year=False)
+        predictor.assert_not_called()
+        self.assertFalse(record["tare_reread"])
+        self.assertIsNone(fields["tare_kg"]["value"])
+
     def test_parseq_reads_each_field_box_as_a_second_engine(self):
         model = field_model([("tare_kg", 0.9, [10, 10, 40, 30])])
         reader = bottle_ocr("TARE 10.7 KG", model, configured_selection(), second=("TARE 10.7KG", 0.4))
